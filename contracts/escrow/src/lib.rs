@@ -51,7 +51,7 @@ impl EscrowContract {
     }
 
     /// Read the total pooled balance.
-    fn get_total_pooled(env: &Env) -> i128 {
+    fn read_total_pooled(env: &Env) -> i128 {
         env.storage()
             .instance()
             .get(&DataKey::TotalPooled)
@@ -142,7 +142,7 @@ impl EscrowContract {
         Self::set_borrower(&env, &borrower, &record);
 
         // Update total pooled.
-        let total = Self::get_total_pooled(&env) + amount;
+        let total = Self::read_total_pooled(&env) + amount;
         env.storage().instance().set(&DataKey::TotalPooled, &total);
 
         env.storage()
@@ -150,6 +150,126 @@ impl EscrowContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
         Ok(())
+    }
+
+    /// Withdraw early from the escrow, receiving a refund minus penalty.
+    ///
+    /// The early withdrawal penalty is deducted as a percentage (basis points)
+    /// of the deposited amount. The remainder is transferred back to the borrower.
+    /// The penalty stays in the contract (future: route to protocol treasury).
+    pub fn withdraw(env: Env, borrower: Address) -> Result<i128, EscrowError> {
+        borrower.require_auth();
+
+        let config = Self::get_config(&env)?;
+        let mut record = Self::get_borrower(&env, &borrower);
+
+        if record.deposited == 0 {
+            return Err(EscrowError::BorrowerNotFound);
+        }
+        if record.released {
+            return Err(EscrowError::AlreadyReleased);
+        }
+        if record.withdrawn {
+            return Err(EscrowError::AlreadyWithdrawn);
+        }
+
+        // Calculate penalty and refund.
+        let penalty = (record.deposited * config.early_withdrawal_penalty_bps as i128) / 10_000;
+        let refund = record.deposited - penalty;
+
+        // Transfer refund back to borrower.
+        let token = get_token_client(&env, &config.token);
+        token.transfer(&env.current_contract_address(), &borrower, &refund);
+
+        // Update total pooled (reduce by full deposited amount; penalty stays).
+        let total = Self::read_total_pooled(&env) - record.deposited;
+        env.storage().instance().set(&DataKey::TotalPooled, &total);
+
+        // Mark as withdrawn.
+        record.withdrawn = true;
+        record.deposited = 0;
+        Self::set_borrower(&env, &borrower, &record);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        Ok(refund)
+    }
+
+    /// Release a borrower's escrowed funds once the savings target is met.
+    ///
+    /// Only callable by the admin. Transfers the borrower's full deposit
+    /// to the specified recipient address (e.g., the lending pool or
+    /// construction fund). Marks the borrower's record as released.
+    pub fn release(
+        env: Env,
+        borrower: Address,
+        recipient: Address,
+    ) -> Result<i128, EscrowError> {
+        let config = Self::get_config(&env)?;
+        config.admin.require_auth();
+
+        let mut record = Self::get_borrower(&env, &borrower);
+
+        if record.deposited == 0 {
+            return Err(EscrowError::BorrowerNotFound);
+        }
+        if record.released {
+            return Err(EscrowError::AlreadyReleased);
+        }
+        if record.withdrawn {
+            return Err(EscrowError::AlreadyWithdrawn);
+        }
+
+        // Verify savings target is met.
+        if record.deposited < config.savings_target {
+            return Err(EscrowError::TargetNotReached);
+        }
+
+        let amount = record.deposited;
+
+        // Transfer to recipient (e.g., lending pool or construction fund).
+        let token = get_token_client(&env, &config.token);
+        token.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        // Update total pooled.
+        let total = Self::read_total_pooled(&env) - amount;
+        env.storage().instance().set(&DataKey::TotalPooled, &total);
+
+        // Mark as released.
+        record.released = true;
+        record.deposited = 0;
+        Self::set_borrower(&env, &borrower, &record);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        Ok(amount)
+    }
+
+    // ── Query Functions ──────────────────────────────────────────────────
+
+    /// Returns the deposited balance for a specific borrower.
+    pub fn get_balance(env: Env, borrower: Address) -> i128 {
+        let record = Self::get_borrower(&env, &borrower);
+        record.deposited
+    }
+
+    /// Returns the full borrower record (deposited, start_ledger, released, withdrawn).
+    pub fn get_borrower_info(env: Env, borrower: Address) -> BorrowerRecord {
+        Self::get_borrower(&env, &borrower)
+    }
+
+    /// Returns the escrow configuration.
+    pub fn get_escrow_config(env: Env) -> Result<EscrowConfig, EscrowError> {
+        Self::get_config(&env)
+    }
+
+    /// Returns the total amount pooled across all borrowers.
+    pub fn get_total_pooled(env: Env) -> i128 {
+        Self::read_total_pooled(&env)
     }
 
     /// Returns the contract version.
@@ -285,5 +405,141 @@ mod test {
         let contract_id = env.register(EscrowContract, ());
         let client = EscrowContractClient::new(&env, &contract_id);
         assert_eq!(client.version(), 1);
+    }
+
+    #[test]
+    fn test_get_balance_and_total_pooled() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, borrower, _token_address, client) = setup_with_token(&env);
+
+        // Before deposit, balance is 0.
+        assert_eq!(client.get_balance(&borrower), 0);
+        assert_eq!(client.get_total_pooled(), 0);
+
+        // After deposit, both update.
+        client.deposit(&borrower, &5_000_0000000i128);
+        assert_eq!(client.get_balance(&borrower), 5_000_0000000i128);
+        assert_eq!(client.get_total_pooled(), 5_000_0000000i128);
+    }
+
+    #[test]
+    fn test_get_borrower_info() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, borrower, _token_address, client) = setup_with_token(&env);
+
+        client.deposit(&borrower, &1_000_0000000i128);
+
+        let info = client.get_borrower_info(&borrower);
+        assert_eq!(info.deposited, 1_000_0000000i128);
+        assert!(!info.released);
+        assert!(!info.withdrawn);
+    }
+
+    #[test]
+    fn test_get_escrow_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, _borrower, token_address, client) = setup_with_token(&env);
+
+        let config = client.get_escrow_config();
+        assert_eq!(config.admin, admin);
+        assert_eq!(config.token, token_address);
+        assert_eq!(config.savings_target, 10_000_0000000i128);
+        assert_eq!(config.early_withdrawal_penalty_bps, 500u32);
+    }
+
+    #[test]
+    fn test_withdraw_with_penalty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, borrower, token_address, client) = setup_with_token(&env);
+        let token = soroban_sdk::token::Client::new(&env, &token_address);
+
+        // Borrower had 50,000 USDC. Deposit 10,000.
+        client.deposit(&borrower, &10_000_0000000i128);
+        assert_eq!(token.balance(&borrower), 40_000_0000000i128);
+
+        // Withdraw — 5% penalty on 10,000 = 500 USDC penalty, 9,500 refund.
+        let refund = client.withdraw(&borrower);
+        assert_eq!(refund, 9_500_0000000i128);
+
+        // Borrower should have 40,000 + 9,500 = 49,500 USDC.
+        assert_eq!(token.balance(&borrower), 49_500_0000000i128);
+
+        // Balance in contract should be 0 + 500 penalty = 500 USDC.
+        assert_eq!(token.balance(&client.address), 500_0000000i128);
+
+        // Total pooled should be 0 (withdrawn amount removed from pool tracking).
+        assert_eq!(client.get_total_pooled(), 0);
+
+        // Borrower record should be marked as withdrawn.
+        let info = client.get_borrower_info(&borrower);
+        assert!(info.withdrawn);
+        assert_eq!(info.deposited, 0);
+    }
+
+    #[test]
+    fn test_double_withdraw_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, borrower, _token_address, client) = setup_with_token(&env);
+
+        client.deposit(&borrower, &5_000_0000000i128);
+        client.withdraw(&borrower);
+
+        // Second withdraw should fail.
+        let result = client.try_withdraw(&borrower);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_release_on_target_met() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, borrower, token_address, client) = setup_with_token(&env);
+        let token = soroban_sdk::token::Client::new(&env, &token_address);
+        let recipient = Address::generate(&env);
+
+        // Deposit exactly the savings target (10,000 USDC).
+        client.deposit(&borrower, &10_000_0000000i128);
+
+        // Admin releases funds to recipient.
+        let released = client.release(&borrower, &recipient);
+        assert_eq!(released, 10_000_0000000i128);
+
+        // Recipient should have received the funds.
+        assert_eq!(token.balance(&recipient), 10_000_0000000i128);
+
+        // Contract balance should be 0.
+        assert_eq!(token.balance(&client.address), 0);
+
+        // Borrower record should be marked as released.
+        let info = client.get_borrower_info(&borrower);
+        assert!(info.released);
+        assert_eq!(info.deposited, 0);
+    }
+
+    #[test]
+    fn test_release_fails_below_target() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, borrower, _token_address, client) = setup_with_token(&env);
+        let recipient = Address::generate(&env);
+
+        // Deposit only 5,000 USDC (target is 10,000).
+        client.deposit(&borrower, &5_000_0000000i128);
+
+        // Release should fail — target not reached.
+        let result = client.try_release(&borrower, &recipient);
+        assert!(result.is_err());
     }
 }
