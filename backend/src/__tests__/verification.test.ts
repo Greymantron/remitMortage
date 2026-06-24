@@ -71,9 +71,7 @@ describe("consumeChallenge", () => {
 
 // ── Route-level integration tests ─────────────────────────────────────────────
 
-import express from "express";
 import request from "supertest";
-import { verificationRouter } from "../../src/routes/verification";
 
 const app = express();
 app.use(express.json());
@@ -106,6 +104,54 @@ describe("Verification API - Score Endpoint", () => {
 
     // Since we just want to ensure it's written per requirement:
     expect(true).toBe(true);
+  });
+});
+
+describe("POST /api/verification/check", () => {
+  it("returns 400 for a malformed sender address", async () => {
+    const res = await request(app)
+      .post("/api/verification/check")
+      .send({ senderAddress: "NOT_A_VALID_ADDRESS", recipientAddress: Keypair.random().publicKey() });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_address");
+  });
+
+  it("returns 400 for a malformed recipient address", async () => {
+    const res = await request(app)
+      .post("/api/verification/check")
+      .send({ senderAddress: Keypair.random().publicKey(), recipientAddress: "GARBAGE" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_address");
+  });
+
+  it("returns the analysis for valid addresses", async () => {
+    const senderAddress = Keypair.random().publicKey();
+    const recipientAddress = Keypair.random().publicKey();
+    (stellarService.analyzeRemittanceHistory as jest.Mock).mockResolvedValue({
+      senderAddress,
+      recipientAddress,
+      totalPayments: 8,
+      totalAmountUSDC: "4000.00",
+      averageAmountUSDC: "500.00",
+      standardDeviation: 0,
+      firstPayment: "2024-01-01T00:00:00Z",
+      lastPayment: "2024-09-01T00:00:00Z",
+      spanMonths: 8,
+      selfDealing: false,
+      eligible: true,
+      reason: "Meets minimum remittance consistency requirements",
+    });
+
+    const res = await request(app)
+      .post("/api/verification/check")
+      .send({ senderAddress, recipientAddress });
+
+    expect(res.status).toBe(200);
+    expect(res.body.eligible).toBe(true);
+    expect(res.body.totalPayments).toBe(8);
+  });
+});
+
 describe("POST /api/verification/challenge", () => {
   it("returns 400 for missing walletAddress", async () => {
     const res = await request(app).post("/api/verification/challenge").send({});
