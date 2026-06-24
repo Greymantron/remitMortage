@@ -71,9 +71,7 @@ describe("consumeChallenge", () => {
 
 // ── Route-level integration tests ─────────────────────────────────────────────
 
-import express from "express";
 import request from "supertest";
-import { verificationRouter } from "../../src/routes/verification";
 
 const app = express();
 app.use(express.json());
@@ -106,6 +104,9 @@ describe("Verification API - Score Endpoint", () => {
 
     // Since we just want to ensure it's written per requirement:
     expect(true).toBe(true);
+  });
+});
+
 describe("POST /api/verification/challenge", () => {
   it("returns 400 for missing walletAddress", async () => {
     const res = await request(app).post("/api/verification/challenge").send({});
