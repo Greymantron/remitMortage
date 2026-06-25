@@ -3,6 +3,25 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
 import { Horizon } from "@stellar/stellar-sdk";
 
+type BalanceLine = {
+  asset_code?: string;
+  balance: string;
+};
+
+type FreighterClient = {
+  requestAccess?: () => void | Promise<void>;
+  getPublicKey?: () => string | Promise<string>;
+  getAccount?: () => string | Promise<string>;
+  getNetwork?: () => string | Promise<string>;
+};
+
+type FreighterWindow = Window & {
+  freighterApi?: FreighterClient;
+  freighter?: {
+    publicKey?: string;
+  };
+};
+
 type WalletContextType = {
   publicKey: string | null;
   isConnected: boolean;
@@ -28,34 +47,31 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   async function fetchBalances(pk: string) {
     try {
       const account = await server.accounts().accountId(pk).call();
-      const usdc = account.balances.find((b: any) => b.asset_code === "USDC");
+      const balances = account.balances as BalanceLine[];
+      const usdc = balances.find((balance) => balance.asset_code === "USDC");
       if (usdc) setUsdcBalance(usdc.balance);
       else setUsdcBalance("0");
-    } catch (err) {
+    } catch {
       setUsdcBalance(null);
     }
   }
 
   async function connect() {
     try {
-      const win: any = window;
+      const win = window as FreighterWindow;
 
-      // Prefer the published freighter API package if available, else fall back to injected window.freighterApi
-      const freighter = (win.freighterApi ?? (await import("@stellar/freighter-api").then((m) => m).catch(() => null))) as any;
+      const freighter = (win.freighterApi ?? (await import("@stellar/freighter-api").then((module) => module as FreighterClient).catch(() => null))) as FreighterClient | null;
 
       if (!freighter) throw new Error("Freighter not available");
 
-      // Request access / permissions if the method exists
       if (typeof freighter.requestAccess === "function") {
         await freighter.requestAccess();
       }
 
-      // Try to read public key
       let pk: string | null = null;
       if (typeof freighter.getPublicKey === "function") {
         pk = await freighter.getPublicKey();
       } else if (typeof freighter.getAccount === "function") {
-        // some older APIs expose getAccount
         pk = await freighter.getAccount();
       } else if (win.freighter?.publicKey) {
         pk = win.freighter.publicKey;
@@ -65,13 +81,11 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
 
       setPublicKey(pk);
 
-      // Attempt to detect network from freighter if available
       let net: string | null = null;
       if (typeof freighter.getNetwork === "function") {
         try {
-          // Some implementations return 'TESTNET' or 'PUBLIC' or 'testnet'
           net = (await freighter.getNetwork()) as string;
-        } catch (e) {
+        } catch {
           net = null;
         }
       }
@@ -79,11 +93,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       setNetwork(net);
       setWrongNetwork(net ? net.toLowerCase().includes("test") === false : false);
 
-      // Fetch balances on testnet horizon
       await fetchBalances(pk);
     } catch (err) {
       console.error("Wallet connect failed", err);
-      // leave state as disconnected
     }
   }
 
@@ -94,7 +106,6 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     setWrongNetwork(false);
   }
 
-  // If user had previously connected, try to populate (best-effort)
   useEffect(() => {
     // no-op for now; avoid automatic permission prompts
   }, []);

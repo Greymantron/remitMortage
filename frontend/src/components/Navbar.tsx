@@ -11,6 +11,7 @@ const NAV_LINKS = [
   { href: "#how-it-works", label: "How It Works" },
   { href: "#features", label: "Features" },
   { href: "#stats", label: "Protocol" },
+  { href: "/invest", label: "Invest" },
   { href: "/dashboard", label: "Dashboard" },
 ];
 
@@ -73,7 +74,6 @@ function InnerNavbar() {
         </div>
       </nav>
 
-      {/* Mobile slide-out drawer */}
       {/* Overlay */}
       {menuOpen && (
         <div
@@ -83,7 +83,7 @@ function InnerNavbar() {
         />
       )}
 
-      {/* Drawer panel */}
+      {/* Mobile slide-out drawer */}
       <div
         id="mobile-menu"
         role="dialog"
