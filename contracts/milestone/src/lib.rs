@@ -245,4 +245,62 @@ impl MilestoneContract {
 }
 
 #[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, BytesN, Env};
+
+    #[test]
+    fn test_initialize_and_double_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let lending = Address::generate(&env);
+
+        let contract_id = env.register(MilestoneContract, ());
+        let client = MilestoneContractClient::new(&env, &contract_id);
+
+        // initialize should succeed (regular call panics on error, so success means no panic).
+        client.initialize(&admin, &token, &lending);
+
+        // double initialize should fail.
+        let res = client.try_initialize(&admin, &token, &lending);
+        assert_eq!(res.unwrap_err(), Ok(MilestoneError::AlreadyInitialized));
+    }
+
+    #[test]
+    fn test_propose_milestone_creates_record() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        let lending = Address::generate(&env);
+        let contractor = Address::generate(&env);
+
+        let contract_id = env.register(MilestoneContract, ());
+        let client = MilestoneContractClient::new(&env, &contract_id);
+
+        client.initialize(&admin, &token, &lending);
+
+        let loan_id = BytesN::from_array(&env, &[1u8; 32]);
+        let evidence = BytesN::from_array(&env, &[2u8; 32]);
+
+        client.propose_milestone(&contractor, &loan_id, &1000i128, &evidence);
+
+        // Read stored milestone via the contract's storage context.
+        env.as_contract(&contract_id, || {
+            let record: MilestoneRecord = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Milestone(loan_id.clone()))
+                .expect("milestone missing");
+            assert_eq!(record.status, MilestoneStatus::Proposed);
+            assert_eq!(record.contractor, contractor);
+            assert_eq!(record.amount, 1000i128);
+            assert_eq!(record.evidence, evidence);
+        });
+    }
+}
 mod test;
