@@ -22,6 +22,6 @@ pub enum EscrowError {
     PeriodExpired = 8,
     /// Borrower record not found.
     BorrowerNotFound = 9,
-    /// The lockup period has not expired yet.
-    PeriodNotExpired = 10,
+    /// Minimum savings lockup period has not elapsed yet.
+    LockupNotMet = 10,
 }
