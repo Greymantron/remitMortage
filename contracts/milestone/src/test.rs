@@ -383,6 +383,7 @@ fn test_release_disburses_via_cross_contract() {
     h.milestone
         .approve_milestone(&h.approvers.get(1).unwrap(), &pid);
 
+    env.ledger().set_sequence_number(100);
     h.milestone.release_milestone(&pid);
 
     // Cross-contract call moved exactly `amount` from the pool to the contractor.
@@ -419,6 +420,40 @@ fn test_release_before_approved_fails() {
 }
 
 #[test]
+fn test_release_is_blocked_until_configured_timelock_elapses() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let h = setup(&env, 2, 2, 5_000, 10_000);
+
+    let pid = proposal_id(&env);
+    h.milestone.propose_milestone(
+        &h.contractor,
+        &pid,
+        &loan_id(&env),
+        &1_000i128,
+        &evidence(&env),
+    );
+    h.milestone
+        .approve_milestone(&h.approvers.get(0).unwrap(), &pid);
+    h.milestone
+        .approve_milestone(&h.approvers.get(1).unwrap(), &pid);
+
+    h.milestone.set_min_delay_ledgers(&h.admin, &5u32);
+
+    let record = h.milestone.get_milestone(&pid);
+    assert_eq!(record.approved_ledger, 0);
+
+    let res = h.milestone.try_release_milestone(&pid);
+    assert_eq!(res, Err(Ok(MilestoneError::TimelockNotElapsed)));
+
+    env.ledger().set_sequence_number(5);
+    h.milestone.release_milestone(&pid);
+
+    let record = h.milestone.get_milestone(&pid);
+    assert_eq!(record.status, MilestoneStatus::Disbursed);
+}
+
+#[test]
 fn test_cannot_release_twice() {
     let env = Env::default();
     env.mock_all_auths();
@@ -438,6 +473,7 @@ fn test_cannot_release_twice() {
     h.milestone
         .approve_milestone(&h.approvers.get(1).unwrap(), &pid);
 
+    env.ledger().set_sequence_number(100);
     h.milestone.release_milestone(&pid);
 
     // Second release is blocked because the milestone is already Disbursed —
@@ -472,6 +508,7 @@ fn test_release_exceeding_pool_cap_fails() {
     h.milestone
         .approve_milestone(&h.approvers.get(1).unwrap(), &pid);
 
+    env.ledger().set_sequence_number(100);
     h.milestone.release_milestone(&pid);
 }
 
