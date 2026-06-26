@@ -1,4 +1,5 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, BytesN};
+use soroban_sdk::{contracttype, Address, Symbol};
 
 /// Configuration set during contract initialization.
 #[contracttype]
@@ -14,6 +15,12 @@ pub struct EscrowConfig {
     pub savings_target: i128,
     /// Maximum savings period in ledger-sequence increments.
     pub max_duration_ledgers: u32,
+    /// Early withdrawal penalty as basis points (e.g. 500 = 5%).
+    pub early_withdrawal_penalty_bps: u32,
+    /// Minimum savings duration in ledgers that must elapse before release is
+    /// permitted (e.g. 518_400 ≈ 6 months at 5-second ledger time).
+    /// A value of 0 disables the lockup check.
+    pub min_duration_ledgers: u32,
     /// Tier 1 penalty (months 1-2) in basis points (e.g. 500 = 5%).
     pub penalty_bps_tier1: u32,
     /// Tier 2 penalty (months 3-4) in basis points.
@@ -22,9 +29,13 @@ pub struct EscrowConfig {
     pub penalty_bps_tier3: u32,
     /// Tier 4 penalty (month 7+) in basis points.
     pub penalty_bps_tier4: u32,
+    /// Ledgers after a missed monthly contribution before default removal is allowed (~120,960 ≈ 7 days).
+    pub grace_period_ledgers: u32,
+    /// Penalty applied on forced default removal, in basis points.
+    pub default_penalty_bps: u32,
 }
 
-/// Tracks an individual borrower's escrow balance and status.
+/// Tracks an individual borrower's escrow balance and status per goal.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct BorrowerRecord {
@@ -46,8 +57,16 @@ pub struct BorrowerRecord {
 pub enum DataKey {
     /// Stores the EscrowConfig. Only one per contract instance.
     Config,
-    /// Stores a BorrowerRecord keyed by the borrower's address.
-    Borrower(Address),
+    /// Stores a BorrowerRecord keyed by the borrower's address and goal ID.
+    Borrower(Address, Symbol),
     /// Total pooled balance across all borrowers.
     TotalPooled,
+    /// Current contract version (incremented on each upgrade).
+    Version,
+    /// Pending upgrade proposal (present only when a timelock delay is active).
+    PendingUpgrade,
+    /// Number of ledgers the admin must wait between proposing and executing an upgrade.
+    UpgradeDelay,
+    /// Emergency pause flag. When true, deposits and withdrawals are blocked.
+    Paused,
 }

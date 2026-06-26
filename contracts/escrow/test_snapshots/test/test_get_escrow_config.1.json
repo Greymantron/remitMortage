@@ -84,6 +84,12 @@
                 },
                 {
                   "u32": 50
+                },
+                {
+                  "u32": 10
+                },
+                {
+                  "u32": 1000
                 }
               ]
             }
@@ -274,6 +280,22 @@
                             },
                             {
                               "key": {
+                                "symbol": "default_penalty_bps"
+                              },
+                              "val": {
+                                "u32": 1000
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "grace_period_ledgers"
+                              },
+                              "val": {
+                                "u32": 10
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "max_duration_ledgers"
                               },
                               "val": {
@@ -347,6 +369,18 @@
                             "hi": 0,
                             "lo": 0
                           }
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Version"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 1
                         }
                       }
                     ]
