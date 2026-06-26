@@ -36,6 +36,8 @@ pub struct PoolConfig {
     pub interest_rate_bps: u32,
     /// Fixed yield rate allocated to senior tranche in basis points (e.g. 400 = 4%).
     pub senior_rate_bps: u32,
+    /// Protocol treasury address where withdrawal fees are routed.
+    pub treasury_address: Address,
 }
 
 /// Tracks an individual investor's capital contribution.
@@ -85,7 +87,7 @@ pub enum LoanStatus {
     /// Loan has defaulted after missed payments.
     Defaulted = 4,
 }
- 
+
 /// Repayment schedule for a loan, tracked on-chain.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -101,7 +103,7 @@ pub struct RepaymentSchedule {
     /// Count of installments missed (consecutive misses are used for default detection).
     pub payments_missed: u32,
 }
- 
+
 /// A loan record for a borrower.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -165,4 +167,6 @@ pub enum DataKey {
     Paused,
     /// Pending new admin address for two-step admin transfer.
     PendingAdmin,
+    /// Total withdrawal fees collected and routed to treasury.
+    TotalWithdrawalFees,
 }
