@@ -183,6 +183,24 @@ impl LendingPoolContract {
             Ok(())
         }
     }
+
+    fn non_reentrant<T, F>(env: &Env, f: F) -> Result<T, PoolError>
+    where
+        F: FnOnce() -> Result<T, PoolError>,
+    {
+        let locked: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Reentrant)
+            .unwrap_or(false);
+        if locked {
+            return Err(PoolError::ReentrancyGuard);
+        }
+        env.storage().instance().set(&DataKey::Reentrant, &true);
+        let result = f();
+        env.storage().instance().set(&DataKey::Reentrant, &false);
+        result
+    }
 }
 
 #[contractimpl]
@@ -254,6 +272,7 @@ impl LendingPoolContract {
     pub fn deposit(env: Env, investor: Address, amount: i128, tranche: Tranche) -> Result<(), PoolError> {
         Self::check_not_paused(&env)?;
         investor.require_auth();
+        Self::non_reentrant(&env, || {
 
         if amount <= 0 {
             return Err(PoolError::InvalidAmount);
@@ -305,6 +324,7 @@ impl LendingPoolContract {
         );
 
         Ok(())
+        }) // non_reentrant
     }
 
     /// Borrower requests a loan for the given principal amount.
@@ -470,6 +490,7 @@ impl LendingPoolContract {
 
         let config = Self::read_config(&env)?;
         config.admin.require_auth();
+        Self::non_reentrant(&env, || {
 
         let mut loan = Self::read_loan(&env, &loan_id)?;
 
@@ -520,6 +541,7 @@ impl LendingPoolContract {
         );
 
         Ok(())
+        }) // non_reentrant
     }
 
     /// Borrower repays toward an approved loan.
@@ -774,6 +796,7 @@ impl LendingPoolContract {
     pub fn withdraw(env: Env, investor: Address, amount: i128) -> Result<(), PoolError> {
         Self::check_not_paused(&env)?;
         investor.require_auth();
+        Self::non_reentrant(&env, || {
 
         if amount <= 0 {
             return Err(PoolError::InvalidAmount);
@@ -817,6 +840,7 @@ impl LendingPoolContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
         Ok(())
+        }) // non_reentrant
     }
 
     /// Investor claims their proportional share of repaid interest.
@@ -2083,6 +2107,78 @@ mod test {
         let (admin, _investor, _token_address, client) = setup_pool(&env);
         env.mock_all_auths();
         let result = client.try_pause();
+        assert!(result.is_ok());
+    }
+
+    // ── Reentrancy guard tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_deposit_blocked_when_reentrant_flag_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, investor, _token_address, client) = setup_pool(&env);
+
+        env.as_contract(&client.address, || {
+            env.storage().instance().set(&DataKey::Reentrant, &true);
+        });
+
+        let result = client.try_deposit(&investor, &1_000_0000000i128, &Tranche::Senior);
+        assert_eq!(result.unwrap_err(), Ok(PoolError::ReentrancyGuard));
+    }
+
+    #[test]
+    fn test_withdraw_blocked_when_reentrant_flag_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, investor, _token_address, client) = setup_pool(&env);
+        client.deposit(&investor, &10_000_0000000i128, &Tranche::Senior);
+
+        env.as_contract(&client.address, || {
+            env.storage().instance().set(&DataKey::Reentrant, &true);
+        });
+
+        let result = client.try_withdraw(&investor, &1_000_0000000i128);
+        assert_eq!(result.unwrap_err(), Ok(PoolError::ReentrancyGuard));
+    }
+
+    #[test]
+    fn test_disburse_blocked_when_reentrant_flag_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, investor, _token_address, client) = setup_pool(&env);
+        client.deposit(&investor, &50_000_0000000i128, &Tranche::Senior);
+
+        let loan_id = BytesN::from_array(&env, &[1u8; 32]);
+        let borrower = Address::generate(&env);
+        client.request_loan(&borrower, &loan_id, &30_000_0000000i128);
+        client.approve_loan(&loan_id);
+
+        env.as_contract(&client.address, || {
+            env.storage().instance().set(&DataKey::Reentrant, &true);
+        });
+
+        let recipient = Address::generate(&env);
+        let result = client.try_disburse(&loan_id, &recipient, &1_000_0000000i128);
+        assert_eq!(result.unwrap_err(), Ok(PoolError::ReentrancyGuard));
+        let _ = admin;
+    }
+
+    #[test]
+    fn test_deposit_succeeds_after_reentrant_flag_cleared() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, investor, _token_address, client) = setup_pool(&env);
+
+        env.as_contract(&client.address, || {
+            env.storage().instance().set(&DataKey::Reentrant, &true);
+            env.storage().instance().set(&DataKey::Reentrant, &false);
+        });
+
+        let result = client.try_deposit(&investor, &1_000_0000000i128, &Tranche::Senior);
         assert!(result.is_ok());
     }
 }
