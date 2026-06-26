@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import { WalletProvider } from "../context/WalletContext";
 import "./globals.css";
 import { ThemeProvider } from "@/context/ThemeContext";
+import { NotificationProvider } from "@/context/NotificationContext";
+import { NotificationLayer } from "@/components/NotificationLayer";
 
 export const metadata: Metadata = {
   title: "RemitMortgage — Remittance-Backed Property Financing on Stellar",
@@ -25,12 +27,16 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${inter.variable}`}>
+    <html lang="en">
       <body className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)] font-[var(--font-inter)] antialiased">
-        <ThemeProvider>{children}</ThemeProvider>
-        <WalletProvider>
-          {children}
-        </WalletProvider>
+        <ThemeProvider>
+          <WalletProvider>
+            <NotificationProvider>
+              {children}
+              <NotificationLayer />
+            </NotificationProvider>
+          </WalletProvider>
+        </ThemeProvider>
       </body>
     </html>
   );
