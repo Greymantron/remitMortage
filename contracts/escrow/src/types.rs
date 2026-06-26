@@ -80,4 +80,6 @@ pub enum DataKey {
     Paused,
     /// Pending new admin address for two-step admin transfer.
     PendingAdmin,
+    /// Reentrancy guard flag — true while a mutating function is executing.
+    Reentrant,
 }

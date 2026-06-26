@@ -36,4 +36,6 @@ pub enum PoolError {
     ContractPaused = 13,
     /// Proposed new admin is not the caller or no transfer is pending.
     NotPendingAdmin = 14,
+    /// Reentrant call detected — mutating function already in progress.
+    ReentrancyGuard = 17,
 }
