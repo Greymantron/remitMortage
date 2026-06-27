@@ -36,6 +36,8 @@ pub struct PoolConfig {
     pub interest_rate_bps: u32,
     /// Fixed yield rate allocated to senior tranche in basis points (e.g. 400 = 4%).
     pub senior_rate_bps: u32,
+    /// Protocol treasury address where withdrawal fees are routed.
+    pub treasury_address: Address,
 }
 
 /// Tracks an individual investor's capital contribution.
@@ -85,7 +87,7 @@ pub enum LoanStatus {
     /// Loan has defaulted after missed payments.
     Defaulted = 4,
 }
- 
+
 /// Repayment schedule for a loan, tracked on-chain.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -101,7 +103,7 @@ pub struct RepaymentSchedule {
     /// Count of installments missed (consecutive misses are used for default detection).
     pub payments_missed: u32,
 }
- 
+
 /// A loan record for a borrower.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -125,8 +127,30 @@ pub struct LoanRecord {
     pub last_interest_ledger: u32,
     /// Total outstanding debt including compounded interest, minus repayments.
     pub outstanding_debt: i128,
+    /// Ledger sequence when the loan was marked defaulted (0 if never defaulted).
+    pub defaulted_ledger: u32,
     /// Optional escrow contract address that originated this loan via the bridge.
     pub escrow_origin: Option<Address>,
+}
+
+/// Aggregate solvency metrics for the pool, returned by `get_pool_health`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolHealth {
+    /// Total liquidity currently held by the pool.
+    pub total_liquidity: i128,
+    /// Outstanding capital committed to approved (active) loans.
+    pub active_loan_commitments: i128,
+    /// Total number of loans ever created.
+    pub total_loans: u32,
+    /// Number of loans that have been marked defaulted.
+    pub defaulted_loans: u32,
+    /// Net realized loss from defaults, after any recoveries.
+    pub total_defaulted_loss: i128,
+    /// Default rate (defaulted_loans / total_loans) in basis points.
+    pub default_rate_bps: u32,
+    /// Loss ratio (total_defaulted_loss / total_deposited) in basis points.
+    pub loss_ratio_bps: u32,
 }
 
 /// Storage keys for the lending pool contract.
@@ -151,6 +175,10 @@ pub enum DataKey {
     JuniorTranche,
     /// Total interest repaid to the pool.
     TotalRepaidInterest,
+    /// Net realized loss from defaulted loans, reduced by recoveries.
+    TotalDefaultedLoss,
+    /// Number of loans that have been marked defaulted.
+    DefaultedLoanCount,
     /// Sum of all principal - disbursed for Approved loans.
     ActiveLoanCommitments,
     /// Sum of all investor deposits minus withdrawals.
@@ -165,4 +193,13 @@ pub enum DataKey {
     Paused,
     /// Pending new admin address for two-step admin transfer.
     PendingAdmin,
+    /// Total withdrawal fees collected and routed to treasury.
+    TotalWithdrawalFees,
+    /// Address of the VerificationRegistry contract used to gate loan requests.
+    /// Absent until `set_verification_registry` is called by the admin.
+    VerificationRegistry,
+    /// Global daily borrow limit.
+    DailyBorrowLimit,
+    /// Tracks total amount borrowed in a specific daily window (day_id).
+    DailyBorrowed(u32),
 }

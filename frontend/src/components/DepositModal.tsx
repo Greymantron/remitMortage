@@ -1,10 +1,16 @@
 "use client"
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { toast } from "react-hot-toast";
 import { X, Loader2, ArrowRight, AlertCircle, CheckCircle2 } from "lucide-react";
 import { useWallet } from "../context/WalletContext";
+import { useTransactionMonitor } from "../hooks/useTransactionMonitor";
 import { buildDepositTx, signAndSubmit } from "../lib/soroban";
+import {
+  formatTransactionErrorMessage,
+  type TransactionModalPhase,
+} from "../lib/transaction-status";
+import TransactionModal from "./tx/TransactionModal";
 
 type Props = {
   isOpen: boolean;
@@ -17,6 +23,53 @@ export default function DepositModal({ isOpen, onClose }: Props) {
   const [estimating, setEstimating] = useState(false);
   const [estimatedFee, setEstimatedFee] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [txPhase, setTxPhase] = useState<TransactionModalPhase>("idle");
+  const [txHash, setTxHash] = useState<string | null>(null);
+  const [txError, setTxError] = useState<string | null>(null);
+  const txMonitor = useTransactionMonitor(txHash ?? undefined);
+
+  function resetTransactionState() {
+    setTxPhase("idle");
+    setTxHash(null);
+    setTxError(null);
+  }
+
+  function handleTransactionModalClose() {
+    const wasSuccessful = txPhase === "success";
+    resetTransactionState();
+
+    if (wasSuccessful) {
+      setAmount("");
+      setEstimatedFee(null);
+      onClose();
+    }
+  }
+
+  useEffect(() => {
+    if (txPhase !== "pending" || !txHash) return;
+
+    if (txMonitor.phase === "confirmed") {
+      setTxPhase("success");
+      return;
+    }
+
+    if (txMonitor.phase === "failed") {
+      setTxError(txMonitor.contractError || "The transaction reverted on-chain.");
+      setTxPhase("error");
+      return;
+    }
+
+    if (txMonitor.pollError) {
+      setTxError(txMonitor.pollError);
+      setTxPhase("error");
+    }
+  }, [
+    txHash,
+    txMonitor.contractError,
+    txMonitor.phase,
+    txMonitor.pollError,
+    txPhase,
+  ]);
 
   if (!isOpen) return null;
 
@@ -41,19 +94,18 @@ export default function DepositModal({ isOpen, onClose }: Props) {
   async function handleConfirm() {
     if (!valid || !publicKey) return;
     setSubmitting(true);
-    const toastId = toast.loading("Preparing transaction...");
+    setTxError(null);
+    setTxHash(null);
+    setTxPhase("simulating");
     try {
       const txXdr = await buildDepositTx(publicKey, amount);
-      toast.loading("Waiting for Freighter signature...", { id: toastId });
+      setTxPhase("signing");
       const hash = await signAndSubmit(txXdr);
-      toast.dismiss();
-      toast.success("Deposit submitted successfully!");
-      setAmount("");
-      setEstimatedFee(null);
-      onClose();
-    } catch (e: any) {
-      toast.dismiss();
-      toast.error(e?.message || "Deposit failed");
+      setTxHash(hash);
+      setTxPhase("pending");
+    } catch (error) {
+      setTxError(formatTransactionErrorMessage(error));
+      setTxPhase("error");
     } finally {
       setSubmitting(false);
     }
@@ -138,6 +190,15 @@ export default function DepositModal({ isOpen, onClose }: Props) {
           </div>
         </div>
       </div>
+
+      <TransactionModal
+        isOpen={txPhase !== "idle"}
+        phase={txPhase}
+        transactionType="Deposit"
+        hash={txHash}
+        errorMessage={txError}
+        onClose={handleTransactionModalClose}
+      />
     </div>
   );
 }
