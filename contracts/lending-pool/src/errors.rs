@@ -36,6 +36,11 @@ pub enum PoolError {
     ContractPaused = 13,
     /// Proposed new admin is not the caller or no transfer is pending.
     NotPendingAdmin = 14,
-    /// Loan is not yet overdue enough to be marked as defaulted.
-    LoanNotOverdue = 17,
+    /// Borrower has no valid, non-expired verification record in the
+    /// configured VerificationRegistry, so the loan request is rejected.
+    ApplicantNotVerified = 17,
+    /// The daily borrow limit has been exceeded.
+    DailyBorrowLimitExceeded = 18,
+    /// Refund amount exceeds the amount disbursed for the loan.
+    RefundExceedsDisbursed = 19,
 }

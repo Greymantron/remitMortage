@@ -5,9 +5,9 @@ import {
   BASE_FEE,
   nativeToScVal,
   Address,
+  rpc as SorobanRpc,
 } from "@stellar/stellar-sdk";
 import { getRpcServer } from "./soroban-rpc";
-import { storeTxSuccessFeedback } from "./transaction-status";
 
 const DEFAULT_NETWORK = Networks.TESTNET;
 const DEFAULT_GOAL = "savings";
@@ -18,6 +18,15 @@ function escrowContractId(): string {
 
 function networkPassphrase(): string {
   return process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE || DEFAULT_NETWORK;
+}
+
+function getSimulationError<T extends object>(simulation: T): string | null {
+  if (!("error" in simulation)) {
+    return null;
+  }
+
+  const error = (simulation as { error?: unknown }).error;
+  return typeof error === "string" ? error : null;
 }
 
 export async function buildDepositTx(borrower: string, amount: string): Promise<string> {
@@ -42,14 +51,12 @@ export async function buildDepositTx(borrower: string, amount: string): Promise<
     .build();
 
   const simulated = await server.simulateTransaction(tx);
-  if (simulated.error) {
-    throw new Error(`Simulation failed: ${simulated.error}`);
+  const simulationError = getSimulationError(simulated);
+  if (simulationError) {
+    throw new Error(`Simulation failed: ${simulationError}`);
   }
 
-  const prepared = TransactionBuilder.cloneFrom(tx, {
-    sorobanData: simulated.transactionData.build(),
-  });
-  return prepared.toXDR();
+  return SorobanRpc.assembleTransaction(tx, simulated).build().toXDR();
 }
 
 export async function buildWithdrawTx(borrower: string): Promise<string> {
@@ -72,14 +79,12 @@ export async function buildWithdrawTx(borrower: string): Promise<string> {
     .build();
 
   const simulated = await server.simulateTransaction(tx);
-  if (simulated.error) {
-    throw new Error(`Simulation failed: ${simulated.error}`);
+  const simulationError = getSimulationError(simulated);
+  if (simulationError) {
+    throw new Error(`Simulation failed: ${simulationError}`);
   }
 
-  const prepared = TransactionBuilder.cloneFrom(tx, {
-    sorobanData: simulated.transactionData.build(),
-  });
-  return prepared.toXDR();
+  return SorobanRpc.assembleTransaction(tx, simulated).build().toXDR();
 }
 
 export async function signAndSubmit(txXdr: string): Promise<string> {
@@ -96,11 +101,14 @@ export async function signAndSubmit(txXdr: string): Promise<string> {
   const tx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase());
   const sendResponse = await server.sendTransaction(tx);
 
-  if (sendResponse.error) {
-    throw new Error(`Submission failed: ${sendResponse.error}`);
+  if (sendResponse.status === "ERROR") {
+    throw new Error("Submission failed on Stellar.");
   }
 
-  storeTxSuccessFeedback(sendResponse.hash, "Deposit");
+  if (sendResponse.status === "TRY_AGAIN_LATER") {
+    throw new Error("Submission delayed by the network. Please retry.");
+  }
+
   return sendResponse.hash;
 }
 
@@ -118,7 +126,11 @@ export async function queryEscrowConfig(publicKey: string): Promise<{ earlyWithd
     .build();
 
   const simulated = await server.simulateTransaction(tx);
-  if (simulated.error) {
+  if (getSimulationError(simulated)) {
+    return { earlyWithdrawalPenaltyBps: 500, savingsTarget: "0" };
+  }
+
+  if (!("result" in simulated) || !simulated.result) {
     return { earlyWithdrawalPenaltyBps: 500, savingsTarget: "0" };
   }
 
