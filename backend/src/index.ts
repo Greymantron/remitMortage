@@ -13,6 +13,7 @@ import { milestoneRouter } from "./routes/milestone.js";
 import { analyticsRouter } from "./routes/analytics.js";
 import { auditRouter } from "./routes/audit.js";
 import { errorHandler } from "./middleware/errorHandler.js";
+import { requestLogger } from "./middleware/requestLogger.js";
 import { startEventListener } from "./services/eventListener.js";
 import { startNotificationScheduler } from "./services/notification.js";
 import { loadConfig } from "./config.js";
@@ -22,6 +23,7 @@ const config = loadConfig();
 const PORT = config.port;
 
 // ── Middleware ───────────────────────────────────────────────────────────
+app.use(requestLogger);
 app.use(helmet());
 app.use(cors({
   origin: (origin, callback) => {
