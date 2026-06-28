@@ -12,7 +12,9 @@ import { borrowerRouter } from "./routes/borrower.js";
 import { loanRouter } from "./routes/loan.js";
 import { milestoneRouter } from "./routes/milestone.js";
 import { analyticsRouter } from "./routes/analytics.js";
+import { auditRouter } from "./routes/audit.js";
 import { errorHandler } from "./middleware/errorHandler.js";
+import { requestLogger } from "./middleware/requestLogger.js";
 import { startEventListener } from "./services/eventListener.js";
 import { startNotificationScheduler } from "./services/notification.js";
 import { startScheduler } from "./jobs/scheduler.js";
@@ -23,6 +25,7 @@ const config = loadConfig();
 const PORT = config.port;
 
 // ── Middleware ───────────────────────────────────────────────────────────
+app.use(requestLogger);
 app.use(helmet());
 app.use(cors({
   origin: (origin, callback) => {
@@ -60,6 +63,7 @@ app.use("/api/borrower", borrowerRouter);
 app.use("/api/loan", loanRouter);
 app.use("/api/milestone", milestoneRouter);
 app.use("/api/analytics", analyticsRouter);
+app.use("/api/audit-logs", auditRouter);
 app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
 // Global error handler (must be after routes)

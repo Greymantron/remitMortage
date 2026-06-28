@@ -90,3 +90,15 @@ model LoanApplication {
   lateFeeBalance     Float      @default(0)
   gracePeriodEndsAt  DateTime?
 }
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  action       String
+  actorAddress String?
+  ipAddress    String?
+  metadata     Json?
+  createdAt    DateTime @default(now())
+
+  @@index([action])
+  @@index([actorAddress])
+}
