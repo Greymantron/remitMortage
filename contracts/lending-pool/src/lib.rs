@@ -495,6 +495,8 @@ impl LendingPoolContract {
             outstanding_debt: 0,
             defaulted_ledger: 0,
             escrow_origin,
+            refinanced_at_ledger: None,
+            previous_rate_bps: None,
         };
 
         Self::set_loan(env, &loan_id, &loan);
@@ -577,6 +579,78 @@ impl LendingPoolContract {
         env.events().publish(
             (Symbol::new(&env, "loan_approved"),),
             (loan_id.clone(),),
+        );
+
+        Ok(())
+    }
+
+    /// Refinance an active loan to extend its term or adjust its interest rate.
+    pub fn refinance_loan(
+        env: Env,
+        loan_id: BytesN<32>,
+        new_interest_rate_bps: u32,
+        new_duration_months: u32,
+    ) -> Result<(), PoolError> {
+        Self::check_not_paused(&env)?;
+        let config = Self::read_config(&env)?;
+        config.admin.require_auth();
+
+        let mut loan = Self::read_loan(&env, &loan_id)?;
+
+        if loan.status != LoanStatus::Approved {
+            return Err(PoolError::InvalidLoanState);
+        }
+
+        if new_interest_rate_bps < 200 {
+            return Err(PoolError::InterestRateTooLow);
+        }
+
+        if !env.storage().persistent().has(&DataKey::LoanSchedule(loan_id.clone())) {
+            return Err(PoolError::RefinanceNotEligible);
+        }
+
+        let mut schedule: RepaymentSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LoanSchedule(loan_id.clone()))
+            .unwrap();
+
+        if schedule.payments_made < 3 {
+            return Err(PoolError::InsufficientPaymentHistory);
+        }
+
+        if schedule.payments_missed > 0 {
+            return Err(PoolError::RefinanceNotEligible);
+        }
+
+        // Accrue any outstanding compound interest before computing what is owed.
+        Self::accrue_interest(&env, &mut loan);
+
+        let remaining_principal = loan.outstanding_debt;
+        let new_interest = (remaining_principal * new_interest_rate_bps as i128) / 10_000;
+        let total_owed = remaining_principal + new_interest;
+
+        // Note: We use a simple unwrap or default to 1 to prevent division by zero
+        let duration = if new_duration_months > 0 { new_duration_months } else { 1 };
+        let monthly_amount = total_owed / (duration as i128);
+
+        schedule.monthly_amount = monthly_amount;
+        schedule.duration_months = new_duration_months;
+        schedule.payments_made = 0;
+        schedule.payments_missed = 0;
+
+        loan.previous_rate_bps = Some(loan.interest_rate_bps);
+        loan.refinanced_at_ledger = Some(env.ledger().sequence());
+        loan.interest_rate_bps = new_interest_rate_bps;
+
+        Self::set_loan(&env, &loan_id, &loan);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LoanSchedule(loan_id.clone()), &schedule);
+
+        env.events().publish(
+            (Symbol::new(&env, "loan_refinanced"),),
+            (loan_id.clone(), new_interest_rate_bps, new_duration_months),
         );
 
         Ok(())
@@ -3209,6 +3283,8 @@ mod test {
         assert_eq!(health.default_rate_bps, 5000);
         // 50,000 / 100,000 = 50% = 5000 bps.
         assert_eq!(health.loss_ratio_bps, 5000);
+    }
+
     #[test]
     fn test_daily_borrow_limit_enforced() {
         let env = Env::default();

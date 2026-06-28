@@ -131,6 +131,10 @@ pub struct LoanRecord {
     pub defaulted_ledger: u32,
     /// Optional escrow contract address that originated this loan via the bridge.
     pub escrow_origin: Option<Address>,
+    /// Ledger sequence when the loan was refinanced.
+    pub refinanced_at_ledger: Option<u32>,
+    /// Previous interest rate before refinancing.
+    pub previous_rate_bps: Option<u32>,
 }
 
 /// Aggregate solvency metrics for the pool, returned by `get_pool_health`.
