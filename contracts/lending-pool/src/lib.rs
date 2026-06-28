@@ -3,6 +3,9 @@
 mod errors;
 mod types;
 
+#[cfg(test)]
+mod fuzz;
+
 pub use crate::errors::PoolError;
 pub use crate::types::{DataKey, InvestorRecord, LoanRecord, LoanStatus, PendingUpgradeRecord, PoolConfig, PoolHealth, RepaymentSchedule, Tranche, TrancheInfo};
 use soroban_sdk::{contract, contractimpl, symbol_short, Symbol, token, Address, BytesN, Env};
