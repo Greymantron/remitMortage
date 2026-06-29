@@ -32,6 +32,8 @@ pub struct EscrowConfig {
     pub grace_period_ledgers: u32,
     /// Penalty applied on forced default removal, in basis points.
     pub default_penalty_bps: u32,
+    /// Optional lending protocol vault address for yield routing.
+    pub yield_vault: Option<Address>,
 }
 
 /// Tracks an individual borrower's escrow balance and status per goal.

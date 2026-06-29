@@ -180,6 +180,7 @@ impl EscrowContract {
 
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::TotalPooled, &0i128);
+        env.storage().instance().set(&DataKey::TotalYieldShares, &0i128);
         env.storage().instance().set(&DataKey::Version, &1u32);
         env.storage()
             .instance()
@@ -219,6 +220,16 @@ impl EscrowContract {
         // Transfer USDC from borrower to this contract.
         let token = get_token_client(&env, &config.token);
         token.transfer(&borrower, &env.current_contract_address(), &amount);
+
+        // Route to yield vault if configured.
+        if let Some(vault) = &config.yield_vault {
+            let invoke_args = soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), amount.into_val(&env)];
+            let shares: i128 = env.invoke_contract(vault, &Symbol::new(&env, "deposit"), invoke_args);
+            
+            record.yield_shares += shares;
+            let total_shares = Self::read_total_yield_shares(&env) + shares;
+            env.storage().instance().set(&DataKey::TotalYieldShares, &total_shares);
+        }
 
         let current_ledger = env.ledger().sequence();
 
@@ -294,9 +305,24 @@ impl EscrowContract {
             config.penalty_bps_tier4
         };
 
+        // Handle yield routing withdrawal
+        let mut amount_withdrawn = record.deposited;
+        if let Some(vault) = &config.yield_vault {
+            if record.yield_shares > 0 {
+                let invoke_args = soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), record.yield_shares.into_val(&env)];
+                amount_withdrawn = env.invoke_contract(vault, &Symbol::new(&env, "withdraw"), invoke_args);
+                
+                let total_shares = Self::read_total_yield_shares(&env) - record.yield_shares;
+                env.storage().instance().set(&DataKey::TotalYieldShares, &total_shares);
+                record.yield_shares = 0;
+            }
+        }
+        
+        let accrued_yield = amount_withdrawn.saturating_sub(record.deposited).max(0);
+
         // Calculate penalty and refund.
         let penalty = (record.deposited * penalty_bps as i128) / 10_000;
-        let refund = record.deposited - penalty;
+        let refund = (record.deposited - penalty) + accrued_yield;
 
         // Transfer refund back to borrower.
         let token = get_token_client(&env, &config.token);
@@ -370,14 +396,24 @@ impl EscrowContract {
             }
         }
 
-        let amount = record.deposited;
+        let mut amount_withdrawn = record.deposited;
+        if let Some(vault) = &config.yield_vault {
+            if record.yield_shares > 0 {
+                let invoke_args = soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), record.yield_shares.into_val(&env)];
+                amount_withdrawn = env.invoke_contract(vault, &Symbol::new(&env, "withdraw"), invoke_args);
+                
+                let total_shares = Self::read_total_yield_shares(&env) - record.yield_shares;
+                env.storage().instance().set(&DataKey::TotalYieldShares, &total_shares);
+                record.yield_shares = 0;
+            }
+        }
 
         // Transfer to recipient (e.g., lending pool or construction fund).
         let token = get_token_client(&env, &config.token);
-        token.transfer(&env.current_contract_address(), &recipient, &amount);
+        token.transfer(&env.current_contract_address(), &recipient, &amount_withdrawn);
 
         // Update total pooled.
-        let total = Self::read_total_pooled(&env) - amount;
+        let total = Self::read_total_pooled(&env) - record.deposited;
         env.storage().instance().set(&DataKey::TotalPooled, &total);
     // ... (deposit, withdraw, release, release_and_request_loan, remove_defaulter, queries remain unchanged) ...
 
@@ -533,6 +569,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 10u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         let goal_id = Symbol::new(env, "land");
@@ -578,6 +615,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 120_960u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         // Verify config was stored by reading from the contract's context.
@@ -632,6 +670,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 120_960u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         };
         client.initialize(&test_config);
         let result = client.try_initialize(&test_config);
@@ -668,6 +707,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 120_960u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         let token = soroban_sdk::token::Client::new(&env, &token_address);
@@ -1294,6 +1334,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 10u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         let recipient = Address::generate(&env);
@@ -1343,6 +1384,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 10u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         let recipient = Address::generate(&env);
@@ -1396,6 +1438,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 10u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         client.deposit(&borrower, &goal_id, &10_000_0000000i128);
@@ -1440,6 +1483,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 10u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         client.deposit(&borrower, &goal_id, &5_000_0000000i128);
@@ -1664,6 +1708,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 10u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         // Register and initialize lending pool.
