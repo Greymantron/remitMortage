@@ -1467,6 +1467,11 @@ impl LendingPoolContract {
         Self::read_loan(&env, &loan_id)
     }
 
+    /// Returns the borrower for a loan, if the loan exists.
+    pub fn get_loan_borrower(env: Env, loan_id: BytesN<32>) -> Option<Address> {
+        Self::read_loan(&env, &loan_id).ok().map(|loan| loan.borrower)
+    }
+
     /// Returns aggregate metrics for the specified tranche.
     ///
     /// Includes total deposited capital, total yield distributed to date,
