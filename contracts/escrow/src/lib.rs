@@ -196,6 +196,7 @@ impl EscrowContract {
     pub fn deposit(env: Env, borrower: Address, goal_id: Symbol, amount: i128) -> Result<(), EscrowError> {
         borrower.require_auth();
         Self::check_not_paused(&env)?;
+        Self::non_reentrant(&env, || {
 
         if amount <= 0 {
             return Err(EscrowError::InvalidAmount);
@@ -245,6 +246,7 @@ impl EscrowContract {
         );
 
         Ok(())
+        }) // non_reentrant
     }
 
     /// Withdraw early from the escrow, receiving a refund minus penalty.
@@ -255,6 +257,7 @@ impl EscrowContract {
     pub fn withdraw(env: Env, borrower: Address, goal_id: Symbol) -> Result<i128, EscrowError> {
         borrower.require_auth();
         Self::check_not_paused(&env)?;
+        Self::non_reentrant(&env, || {
 
         let config = Self::get_config(&env)?;
         let mut record = Self::get_borrower(&env, &borrower, &goal_id);
@@ -318,6 +321,7 @@ impl EscrowContract {
         );
 
         Ok(refund)
+        }) // non_reentrant
     }
 
     /// Release a borrower's escrowed funds once the savings target is met
@@ -335,6 +339,7 @@ impl EscrowContract {
         Self::check_not_paused(&env)?;
         let config = Self::get_config(&env)?;
         config.admin.require_auth();
+        Self::non_reentrant(&env, || {
 
         let mut record = Self::get_borrower(&env, &borrower, &goal_id);
 
@@ -1738,6 +1743,76 @@ mod test {
         // Second call should fail (deposited is 0 after first call).
         let result = escrow.try_release_and_request_loan(&borrower, &goal, &pool.address, &recipient);
         assert!(result.is_err());
+    }
+
+    // ── Reentrancy guard tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_deposit_blocked_when_reentrant_flag_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, borrower, _token_address, goal_id, client) = setup_with_token(&env);
+
+        // Simulate a reentrant call by pre-setting the guard flag.
+        env.as_contract(&client.address, || {
+            env.storage().instance().set(&DataKey::Reentrant, &true);
+        });
+
+        let result = client.try_deposit(&borrower, &goal_id, &1_000_0000000i128);
+        assert_eq!(result.unwrap_err(), Ok(EscrowError::ReentrancyGuard));
+    }
+
+    #[test]
+    fn test_withdraw_blocked_when_reentrant_flag_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, borrower, _token_address, goal_id, client) = setup_with_token(&env);
+        client.deposit(&borrower, &goal_id, &1_000_0000000i128);
+
+        env.as_contract(&client.address, || {
+            env.storage().instance().set(&DataKey::Reentrant, &true);
+        });
+
+        let result = client.try_withdraw(&borrower, &goal_id);
+        assert_eq!(result.unwrap_err(), Ok(EscrowError::ReentrancyGuard));
+    }
+
+    #[test]
+    fn test_release_blocked_when_reentrant_flag_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, borrower, _token_address, goal_id, client) = setup_with_token(&env);
+        client.deposit(&borrower, &goal_id, &10_000_0000000i128);
+
+        env.as_contract(&client.address, || {
+            env.storage().instance().set(&DataKey::Reentrant, &true);
+        });
+
+        let recipient = Address::generate(&env);
+        let result = client.try_release(&borrower, &goal_id, &recipient);
+        assert_eq!(result.unwrap_err(), Ok(EscrowError::ReentrancyGuard));
+        let _ = admin;
+    }
+
+    #[test]
+    fn test_deposit_succeeds_after_reentrant_flag_cleared() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, borrower, _token_address, goal_id, client) = setup_with_token(&env);
+
+        // Set then clear the flag.
+        env.as_contract(&client.address, || {
+            env.storage().instance().set(&DataKey::Reentrant, &true);
+            env.storage().instance().set(&DataKey::Reentrant, &false);
+        });
+
+        // Should succeed normally.
+        let result = client.try_deposit(&borrower, &goal_id, &1_000_0000000i128);
+        assert!(result.is_ok());
     }
 }
     pub fn get_pending_penalty_tiers(env: Env) -> Option<PendingPenaltyProposal> {

@@ -379,6 +379,7 @@ impl LendingPoolContract {
     pub fn deposit(env: Env, investor: Address, amount: i128, tranche: Tranche) -> Result<(), PoolError> {
         Self::check_not_paused(&env)?;
         investor.require_auth();
+        Self::non_reentrant(&env, || {
 
         if amount <= 0 {
             return Err(PoolError::InvalidAmount);
@@ -429,6 +430,7 @@ impl LendingPoolContract {
         );
 
         Ok(())
+        }) // non_reentrant
     }
 
     /// Deposit penalty/fee revenue into the pool and distribute it as yield.
@@ -728,6 +730,7 @@ impl LendingPoolContract {
 
         let config = Self::read_config(&env)?;
         config.admin.require_auth();
+        Self::non_reentrant(&env, || {
 
         let mut loan = Self::read_loan(&env, &loan_id)?;
 
@@ -804,6 +807,7 @@ impl LendingPoolContract {
         );
 
         Ok(())
+        }) // non_reentrant
     }
 
     /// Refund disputed milestone funds back to the pool.
@@ -1354,6 +1358,7 @@ impl LendingPoolContract {
         );
 
         Ok(())
+        }) // non_reentrant
     }
 
     /// Investor claims their proportional share of repaid interest.

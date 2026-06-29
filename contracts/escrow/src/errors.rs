@@ -40,4 +40,6 @@ pub enum EscrowError {
     NotPendingAdmin = 15,
     /// Cross-contract bridge call to the lending pool failed.
     BridgeFailed = 16,
+    /// Reentrant call detected — mutating function already in progress.
+    ReentrancyGuard = 18,
 }
