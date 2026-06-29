@@ -1,6 +1,5 @@
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 generator client {
@@ -13,25 +12,102 @@ enum NotificationStatus {
   Failed
 }
 
+enum LoanStatus {
+  Pending
+  Approved
+  Rejected
+  Disbursing
+  Repaying
+  Completed
+}
+
 model Notification {
-  id        String             @id @default(uuid())
-  recipient String
-  type      String             // "EMAIL" or "WEBHOOK"
-  content   String             // HTML for emails or JSON payload for webhooks
-  status    NotificationStatus @default(Pending)
-  createdAt DateTime           @default(now())
-  updatedAt DateTime           @updatedAt
-  attempts  Int                @default(0)
-  lastError String?
+  id          String             @id @default(uuid())
+  recipient   String
+  type        String // "EMAIL" or "WEBHOOK"
+  content     String // HTML for emails or JSON payload for webhooks
+  status      NotificationStatus @default(Pending)
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+  attempts    Int                @default(0)
+  lastError   String?
   nextRetryAt DateTime?
 }
 
 model UnpinnedCid {
   id           String   @id @default(uuid())
   cid          String
-  proposalId     String?
+  proposalId   String?
   success      Boolean
   pinataStatus Int?
   error        String?
   createdAt    DateTime @default(now())
+}
+
+enum VerificationStatus {
+  PENDING
+  ELIGIBLE
+  INELIGIBLE
+}
+
+enum LoanStatus {
+  PENDING
+  APPROVED
+  ACTIVE
+  REPAID
+  DEFAULTED
+}
+
+model Applicant {
+  id                 String             @id @default(uuid())
+  stellarAddress     String             @unique
+  verificationStatus VerificationStatus @default(PENDING)
+  creditScore        Int?
+  taxId              String?
+  monthlyIncome      String?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  verificationResults VerificationResult[]
+  loanApplications    LoanApplication[]
+}
+
+model VerificationResult {
+  id             String    @id @default(uuid())
+  applicantId    String
+  applicant      Applicant @relation(fields: [applicantId], references: [id])
+  reportHash     String
+  totalPayments  Int
+  totalVolume    Float
+  spanMonths     Float
+  eligible       Boolean
+  analyzedAt     DateTime  @default(now())
+}
+
+model LoanApplication {
+  id                 String     @id @default(uuid())
+  applicantId        String
+  applicant          Applicant  @relation(fields: [applicantId], references: [id])
+  escrowContractId   String?
+  loanId             String?
+  principal          Float
+  status             LoanStatus @default(PENDING)
+  createdAt          DateTime   @default(now())
+
+  // New fields for repayment tracking
+  dueDate            DateTime?
+  missedPayments     Int        @default(0)
+  lateFeeBalance     Float      @default(0)
+  gracePeriodEndsAt  DateTime?
+}
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  action       String
+  actorAddress String?
+  ipAddress    String?
+  metadata     Json?
+  createdAt    DateTime @default(now())
+
+  @@index([action])
+  @@index([actorAddress])
 }

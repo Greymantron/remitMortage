@@ -24,12 +24,37 @@ pub enum PoolError {
     InsufficientLiquidity = 9,
     /// Repayment exceeds remaining loan balance.
     OverPayment = 10,
+    /// Loan has not met the criteria for default.
+    NotEligibleForDefault = 11,
+    /// Loan has already defaulted.
+    AlreadyDefaulted = 12,
     /// No pending upgrade exists to execute.
     UpgradeNotPending = 11,
     /// Upgrade was proposed but the timelock delay has not elapsed yet.
     UpgradeTimelockActive = 12,
     /// Investor cannot change tranche after the initial deposit.
-    TrancheMismatch = 11,
+    TrancheMismatch = 15,
     /// Junior tranche has insufficient capital to absorb this loss.
-    InsufficientJuniorCapital = 12,
+    InsufficientJuniorCapital = 16,
+    /// Operation rejected because the contract is paused.
+    ContractPaused = 13,
+    /// Proposed new admin is not the caller or no transfer is pending.
+    NotPendingAdmin = 14,
+    /// Borrower has no valid, non-expired verification record in the
+    /// configured VerificationRegistry, so the loan request is rejected.
+    ApplicantNotVerified = 17,
+    /// The daily borrow limit has been exceeded.
+    DailyBorrowLimitExceeded = 18,
+    /// Refund amount exceeds the amount disbursed for the loan.
+    RefundExceedsDisbursed = 19,
+    /// Disbursement recipient is not a whitelisted contractor.
+    UnauthorizedContractor = 20,
+    /// Refinancing requires at least 3 successful payments.
+    InsufficientPaymentHistory = 21,
+    /// Interest rate for refinancing is below the allowed floor.
+    InterestRateTooLow = 22,
+    /// Loan cannot be refinanced.
+    RefinanceNotEligible = 23,
+    /// Loan is not yet overdue, so it cannot be marked as defaulted.
+    LoanNotOverdue = 24,
 }

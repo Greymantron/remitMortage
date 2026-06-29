@@ -8,7 +8,16 @@ import { useRouter } from "next/navigation";
 import { WalletProvider, useWallet } from "../../context/WalletContext";
 import SavingsProgressCard from "../../components/SavingsProgressCard";
 import LoanStatusCard from "../../components/LoanStatusCard";
-import DepositForm from "../../components/DepositForm";
+import DepositModal from "../../components/DepositModal";
+import WithdrawModal from "../../components/WithdrawModal";
+import MilestoneTimeline, {
+  type MilestoneNode,
+} from "../../components/MilestoneTimeline";
+import {
+  consumeTxSuccessFeedback,
+  shortenAddress,
+  STELLARCHAIN_TX_BASE,
+} from "../../lib/transaction-status";
 
 const Navbar = loadDynamic(() => import("../../components/Navbar"), { ssr: false });
 
@@ -18,12 +27,90 @@ type BorrowerStatus = {
   loan: { status: string; principal: string; disbursed: string; repaid: string };
 };
 
+/** Sample milestones — replace with API fetch once /api/borrower/:id/milestones exists. */
+const SAMPLE_MILESTONES: MilestoneNode[] = [
+  {
+    id: "m1",
+    title: "Foundation Inspection",
+    state: "Disbursed",
+    scheduledDate: "2026-03-15",
+    completedDate: "2026-03-14",
+    description: "Structural foundation inspection and soil report verification.",
+    evidence: [
+      { label: "Inspection Report (PDF)", url: "ipfs://QmX1...foundation" },
+      { label: "Soil Analysis", url: "https://example.com/soil-report" },
+    ],
+    voters: [
+      { address: "GABC...1234", vote: "yes", weight: 40 },
+      { address: "GDEF...5678", vote: "yes", weight: 35 },
+      { address: "GHIJ...9012", vote: "abstain", weight: 25 },
+    ],
+  },
+  {
+    id: "m2",
+    title: "Framing Completion",
+    state: "Approved",
+    scheduledDate: "2026-05-01",
+    completedDate: "2026-04-28",
+    description: "Wall framing, roof trusses, and window installation verified.",
+    evidence: [
+      { label: "Framing Photos", url: "ipfs://QmY2...framing" },
+      { label: "Contractor Sign-off", url: "ipfs://QmZ3...signoff" },
+    ],
+    voters: [
+      { address: "GABC...1234", vote: "yes", weight: 40 },
+      { address: "GDEF...5678", vote: "yes", weight: 35 },
+      { address: "GHIJ...9012", vote: "yes", weight: 25 },
+    ],
+  },
+  {
+    id: "m3",
+    title: "Plumbing & Electrical",
+    state: "Voting",
+    scheduledDate: "2026-06-15",
+    description: "Full plumbing rough-in and electrical wiring inspection.",
+    evidence: [
+      { label: "Plumbing Permit", url: "ipfs://QmA4...plumbing" },
+    ],
+    voters: [
+      { address: "GABC...1234", vote: "yes", weight: 40 },
+      { address: "GDEF...5678", vote: "no", weight: 35 },
+      { address: "GHIJ...9012", vote: "yes", weight: 25 },
+    ],
+  },
+  {
+    id: "m4",
+    title: "Final Finishes",
+    state: "Proposed",
+    scheduledDate: "2026-08-01",
+    description: "Interior paint, flooring, fixtures, and final walkthrough.",
+  },
+  {
+    id: "m5",
+    title: "Occupancy Permit",
+    state: "Proposed",
+    scheduledDate: "2026-09-01",
+    description: "Certificate of occupancy issued by local authority.",
+  },
+];
+
 function DashboardInner() {
   const router = useRouter();
   const { publicKey, isConnected } = useWallet();
   const [status, setStatus] = useState<BorrowerStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [txSuccess, setTxSuccess] = useState<{ hash: string; type: string } | null>(null);
+  const [showDeposit, setShowDeposit] = useState(false);
+  const [showWithdraw, setShowWithdraw] = useState(false);
+  const [milestones, setMilestones] = useState<MilestoneNode[]>([]);
+
+  useEffect(() => {
+    const feedback = consumeTxSuccessFeedback();
+    if (feedback) {
+      setTxSuccess(feedback);
+    }
+  }, []);
 
   useEffect(() => {
     if (!isConnected) {
@@ -41,6 +128,9 @@ function DashboardInner() {
         if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
         const data = await res.json();
         setStatus(data);
+
+        // Load milestone timeline (placeholder until API endpoint exists)
+        setMilestones(SAMPLE_MILESTONES);
       } catch (e: any) {
         setError(e?.message || "Failed to load borrower status");
       } finally {
@@ -57,6 +147,39 @@ function DashboardInner() {
       <main className="max-w-4xl mx-auto px-6 py-24">
         <h1 className="text-3xl font-bold mb-6">Borrower Dashboard</h1>
 
+        {txSuccess && (
+          <div
+            role="status"
+            className="mb-6 p-4 rounded-lg border border-emerald-500/30 bg-emerald-500/10 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3"
+          >
+            <div>
+              <p className="text-sm font-semibold text-emerald-400">
+                {txSuccess.type} confirmed successfully
+              </p>
+              <p className="text-xs text-[var(--text-secondary)] mt-0.5">
+                Transaction {shortenAddress(txSuccess.hash)} is on-chain.
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <a
+                href={`${STELLARCHAIN_TX_BASE}${txSuccess.hash}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-xs text-[var(--accent-primary-light)] hover:underline"
+              >
+                View on explorer
+              </a>
+              <button
+                type="button"
+                onClick={() => setTxSuccess(null)}
+                className="text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
+
         {loading && <div className="p-6 bg-[var(--bg-card)] rounded-md">Loading...</div>}
         {error && <div className="p-6 bg-red-50 text-red-700 rounded-md">{error}</div>}
 
@@ -69,8 +192,39 @@ function DashboardInner() {
             />
             <div className="space-y-6">
               <LoanStatusCard loan={status.loan} />
-              <DepositForm address={status.address} />
+              <div className="flex flex-col gap-3 p-6 bg-[var(--bg-card)] rounded-md">
+                <h3 className="text-lg font-semibold mb-2">Deposit USDC</h3>
+                <button
+                  onClick={() => setShowDeposit(true)}
+                  className="btn-primary justify-center"
+                >
+                  Open Deposit
+                </button>
+                <button
+                  onClick={() => setShowWithdraw(true)}
+                  className="btn-outline justify-center"
+                >
+                  Early Withdrawal
+                </button>
+              </div>
             </div>
+          </div>
+        )}
+
+        <DepositModal isOpen={showDeposit} onClose={() => setShowDeposit(false)} />
+        <WithdrawModal
+          isOpen={showWithdraw}
+          onClose={() => setShowWithdraw(false)}
+          deposited={status?.escrow.deposited || "0"}
+        />
+
+        {/* Milestone Timeline */}
+        {!loading && !error && milestones.length > 0 && (
+          <div className="mt-8">
+            <MilestoneTimeline
+              milestones={milestones}
+              title="Loan Milestone Timeline"
+            />
           </div>
         )}
 

@@ -1,5 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN};
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol};
 
 /// Configuration set during contract initialization.
 #[contracttype]
@@ -9,6 +8,8 @@ pub struct EscrowConfig {
     pub admin: Address,
     /// USDC token contract address on Stellar.
     pub token: Address,
+    /// Lending pool contract address linked to this escrow.
+    pub lending_pool: Address,
     /// Savings target amount in USDC (in stroops, i.e. 7 decimals).
     pub savings_target: i128,
     /// Maximum savings period in ledger-sequence increments.
@@ -27,6 +28,10 @@ pub struct EscrowConfig {
     pub penalty_bps_tier3: u32,
     /// Tier 4 penalty (month 7+) in basis points.
     pub penalty_bps_tier4: u32,
+    /// Ledgers after a missed monthly contribution before default removal is allowed (~120,960 ≈ 7 days).
+    pub grace_period_ledgers: u32,
+    /// Penalty applied on forced default removal, in basis points.
+    pub default_penalty_bps: u32,
 }
 
 /// Tracks an individual borrower's escrow balance and status per goal.
@@ -41,18 +46,8 @@ pub struct BorrowerRecord {
     pub released: bool,
     /// Whether the borrower withdrew early.
     pub withdrawn: bool,
-    /// Savings target amount specific to this goal.
-    pub target_amount: i128,
-}
-
-/// Pending upgrade proposal (used when upgrade_delay_ledgers > 0).
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct PendingUpgradeRecord {
-    /// The WASM hash queued for deployment.
-    pub new_wasm_hash: BytesN<32>,
-    /// The ledger sequence after which this upgrade may execute.
-    pub execute_after: u32,
+    /// Whether the collateral was seized by the lending pool due to default.
+    pub seized: bool,
 }
 
 /// Storage keys for the escrow contract.
@@ -71,4 +66,11 @@ pub enum DataKey {
     PendingUpgrade,
     /// Number of ledgers the admin must wait between proposing and executing an upgrade.
     UpgradeDelay,
+    /// Emergency pause flag. When true, deposits and withdrawals are blocked.
+    Paused,
+    /// Pending new admin address for two-step admin transfer.
+    PendingAdmin,
+    /// Optional LendingPool contract address that early-exit penalty fees are
+    /// routed to as investor yield. Unset means penalties stay in the contract.
+    LendingPool,
 }

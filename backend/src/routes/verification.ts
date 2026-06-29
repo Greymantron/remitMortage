@@ -1,96 +1,86 @@
 import { Router } from "express";
 import crypto from "crypto";
+import jwt from "jsonwebtoken";
 import { Keypair } from "@stellar/stellar-sdk";
+import logger from "../utils/logger.js";
 import { analyzeRemittanceHistory } from "../services/stellar.js";
 import { hashReportContent, streamVerificationPdf, VerificationReport } from "../services/pdf.js";
-import { validateVerificationBody } from "../middleware/validate.js";
 import { calculateCreditScore } from "../services/scoring.js";
-import { validateVerificationBody, validateWalletAddress } from "../middleware/validate.js";
+import { validateVerificationBody, validateWalletAddress, validateMultiChainOwnership } from "../middleware/validate.js";
+import {
+  verificationChallengeRateLimiter,
+  verificationOwnershipRateLimiter,
+} from "../middleware/rateLimit.js";
 import { createChallenge, consumeChallenge } from "../services/challengeStore.js";
+import { verifyEvmSignature } from "../services/evm.js";
+import { verifySolanaSignature } from "../services/solana.js";
+import { upsertApplicant, createVerificationResult } from "../services/db.js";
 
 export const verificationRouter = Router();
-
-/**
- * Simple in-memory store keyed by reportId.
- * In production this should be replaced by a persistent database (PostgreSQL).
- */
-const reportStore = new Map<string, VerificationReport>();
 
 /**
  * @openapi
  * /api/verification/check:
  *   post:
  *     summary: Analyze remittance payment history
+ *     tags:
+ *       - Verification
  *     description: |
  *       Accepts a Stellar sender wallet and recipient address, queries Horizon for
  *       outgoing USDC payments, and returns a remittance eligibility summary.
  *       The response also includes a `reportId` and `reportHash` — the SHA-256
  *       hash of the report content — ready for on-chain anchoring in the
  *       verification registry contract.
- *     tags:
- *       - Verification
  *     requestBody:
  *       required: true
  *       content:
  *         application/json:
  *           schema:
  *             $ref: '#/components/schemas/VerificationCheckRequest'
- *           examples:
- *             check:
- *               value:
- *                 senderAddress: GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF
- *                 recipientAddress: GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBCJ
  *     responses:
  *       200:
  *         description: Remittance analysis completed.
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/RemittanceAnalysis'
  *       400:
  *         description: Required request fields are missing.
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
  *       500:
  *         description: Verification service failed unexpectedly.
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ErrorResponse'
  */
 verificationRouter.post("/check", validateVerificationBody, async (req, res) => {
   try {
     const { senderAddress, recipientAddress } = req.body;
+    const analysis = await analyzeRemittanceHistory(senderAddress, recipientAddress, {
+      invalidateCache: true,
+    });
 
-    const analysis = await analyzeRemittanceHistory(senderAddress, recipientAddress);
-
-    // Generate a unique report ID and timestamp.
     const reportId = crypto.randomUUID();
     const generatedAt = new Date().toISOString();
-
-    // Compute SHA-256 hash of the report content for on-chain anchoring.
     const reportHash = hashReportContent(reportId, generatedAt, analysis);
 
-    const report: VerificationReport = {
-      reportId,
-      generatedAt,
-      analysis,
-      reportHash,
-    };
-
-    // Cache the report so it can be downloaded via GET /report/:reportId.
+    const report: VerificationReport = { reportId, generatedAt, analysis, reportHash };
     reportStore.set(reportId, report);
 
-    res.json({
-      ...analysis,
-      reportId,
-      generatedAt,
-      reportHash,
-    });
+    // Persist applicant and verification result — non-blocking on failure
+    try {
+      const { score } = calculateCreditScore(analysis);
+      const applicant = await upsertApplicant(senderAddress, {
+        verificationStatus: analysis.eligible ? "ELIGIBLE" : "INELIGIBLE",
+        creditScore: score,
+      });
+      await createVerificationResult({
+        applicantId: applicant.id,
+        reportHash,
+        totalPayments: analysis.totalPayments,
+        totalVolume: Number(analysis.totalAmountUSDC),
+        spanMonths: analysis.spanMonths,
+        eligible: analysis.eligible,
+      });
+    } catch (dbErr) {
+      console.error("DB persist error (non-fatal):", dbErr);
+    }
+
+    res.json({ ...analysis, reportId, generatedAt, reportHash });
   } catch (error) {
-    console.error("Verification error:", error);
+    logger.error("Verification error", { error });
     res.status(500).json({ error: "Verification service failed" });
   }
 });
@@ -136,17 +126,26 @@ verificationRouter.post("/check", validateVerificationBody, async (req, res) => 
  *             schema:
  *               $ref: '#/components/schemas/ErrorResponse'
  */
-verificationRouter.get("/report/:reportId", (req, res) => {
+verificationRouter.get("/report/:reportId", async (req, res) => {
   try {
     const { reportId } = req.params;
-    const report = reportStore.get(reportId);
+    const record = await prisma.verificationResult.findUnique({
+      where: { id: reportId },
+    });
 
-    if (!report) {
+    if (!record) {
       return res.status(404).json({
         error: "report_not_found",
         message: `No report found for ID: ${reportId}`,
       });
     }
+
+    const report: VerificationReport = {
+      reportId: record.id,
+      generatedAt: record.generatedAt.toISOString(),
+      analysis: record.analysis as any,
+      reportHash: record.reportHash,
+    };
 
     const filename = `remitmortgage-verification-${reportId.slice(0, 8)}.pdf`;
 
@@ -158,20 +157,19 @@ verificationRouter.get("/report/:reportId", (req, res) => {
 
     streamVerificationPdf(report, res);
   } catch (error) {
-    console.error("PDF generation error:", error);
+    logger.error("PDF generation error", { error });
     res.status(500).json({ error: "PDF generation failed" });
   }
 });
+
+/**
+ * @openapi
  * /api/verification/score:
  *   post:
  *     summary: Calculate borrower credit score
- *     description: Analyzes remittance history and calculates a 0-100 credit score with tier mapping.
  *     tags:
  *       - Verification
- * /api/verification/challenge:
- *   post:
- *     summary: Issue a wallet-ownership challenge
- *     tags: [Verification]
+ *     description: Analyzes remittance history and calculates a 0-100 credit score with tier mapping.
  *     requestBody:
  *       required: true
  *       content:
@@ -189,33 +187,41 @@ verificationRouter.get("/report/:reportId", (req, res) => {
 verificationRouter.post("/score", validateVerificationBody, async (req, res) => {
   try {
     const { senderAddress, recipientAddress } = req.body;
-
-    const analysisResult = await analyzeRemittanceHistory(
-      senderAddress,
-      recipientAddress
-    );
-
+    const analysisResult = await analyzeRemittanceHistory(senderAddress, recipientAddress);
     const scoreResult = calculateCreditScore(analysisResult);
-
     res.json(scoreResult);
   } catch (error) {
-    console.error("Scoring error:", error);
+    logger.error("Scoring error", { error });
     res.status(500).json({ error: "Scoring service failed" });
   }
 });
 
+/**
+ * @openapi
+ * /api/verification/challenge:
+ *   post:
+ *     summary: Issue a wallet-ownership challenge
+ *     tags: [Verification]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
  *             type: object
- *             required: [walletAddress]
+ *             required: [walletAddress, network]
  *             properties:
  *               walletAddress:
  *                 type: string
+ *               network:
+ *                 type: string
+ *                 enum: [stellar, ethereum, solana]
  *     responses:
  *       200:
  *         description: Challenge string to sign.
  *       400:
- *         description: Invalid or missing walletAddress.
+ *         description: Invalid or missing walletAddress / network.
  */
-verificationRouter.post("/challenge", validateWalletAddress, (req, res) => {
+verificationRouter.post("/challenge", verificationChallengeRateLimiter, validateMultiChainOwnership, (req, res) => {
   const { walletAddress } = req.body;
   const challenge = createChallenge(walletAddress);
   res.json({ challenge });
@@ -233,25 +239,30 @@ verificationRouter.post("/challenge", validateWalletAddress, (req, res) => {
  *         application/json:
  *           schema:
  *             type: object
- *             required: [walletAddress, challenge, signature]
+ *             required: [walletAddress, network, challenge, signature]
  *             properties:
  *               walletAddress:
  *                 type: string
+ *               network:
+ *                 type: string
+ *                 enum: [stellar, ethereum, solana]
  *               challenge:
  *                 type: string
  *               signature:
  *                 type: string
- *                 description: Hex-encoded Ed25519 signature of the challenge.
+ *                 description: Hex-encoded signature of the challenge.
  *     responses:
  *       200:
  *         description: Ownership verified.
+ *       400:
+ *         description: Missing required fields.
  *       401:
  *         description: Invalid signature.
  *       410:
  *         description: Challenge expired or already used.
  */
-verificationRouter.post("/verify-ownership", validateWalletAddress, (req, res) => {
-  const { walletAddress, challenge, signature } = req.body;
+verificationRouter.post("/verify-ownership", verificationOwnershipRateLimiter, validateMultiChainOwnership, (req, res) => {
+  const { walletAddress, network, challenge, signature } = req.body;
 
   if (!challenge || !signature) {
     res.status(400).json({ error: "missing_field", message: "challenge and signature are required" });
@@ -264,21 +275,39 @@ verificationRouter.post("/verify-ownership", validateWalletAddress, (req, res) =
     return;
   }
 
+  let valid = false;
   try {
-    const keypair = Keypair.fromPublicKey(walletAddress);
-    const messageBytes = Buffer.from(challenge, "utf8");
-    const sigBytes = Buffer.from(signature, "hex");
-    const valid = keypair.verify(messageBytes, sigBytes);
-    if (!valid) {
-      res.status(401).json({ error: "invalid_signature" });
-      return;
+    if (network === "stellar") {
+      const keypair = Keypair.fromPublicKey(walletAddress);
+      const messageBytes = Buffer.from(challenge, "utf8");
+      const sigBytes = Buffer.from(signature, "hex");
+      valid = keypair.verify(messageBytes, sigBytes);
+    } else if (network === "ethereum") {
+      valid = verifyEvmSignature(walletAddress, challenge, signature);
+    } else if (network === "solana") {
+      valid = verifySolanaSignature(walletAddress, challenge, signature);
     }
   } catch {
+    valid = false;
+  }
+
+  if (!valid) {
     res.status(401).json({ error: "invalid_signature" });
     return;
   }
 
-  // Track verified wallets in session (stored in req.app.locals per session key is
-  // out of scope here; we keep it simple with the response — callers accumulate them).
-  res.json({ verified: true, walletAddress });
+  const token = jwt.sign(
+    { walletAddress, network },
+    process.env.JWT_SECRET || "default_jwt_secret",
+    { expiresIn: "24h" }
+  );
+
+  res.cookie("token", token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "strict",
+    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+  });
+
+  res.json({ verified: true, walletAddress, network });
 });
