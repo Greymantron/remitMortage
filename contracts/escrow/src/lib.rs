@@ -15,7 +15,10 @@ use crate::token_utils::get_token_client;
 use crate::types::DataKey;
 pub use crate::types::{BorrowerRecord, EscrowConfig, PendingUpgradeRecord, PendingPenaltyProposal};
 use lending_pool::LendingPoolContractClient;
-use soroban_sdk::{contract, contractimpl, symbol_short, xdr::ToXdr, Address, BytesN, Env, Symbol};
+use soroban_sdk::auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation};
+use soroban_sdk::{
+    contract, contractimpl, symbol_short, vec, xdr::ToXdr, Address, BytesN, Env, IntoVal, Symbol,
+};
 
 const INSTANCE_BUMP_AMOUNT: u32 = 518_400; // ~30 days
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 129_600; // ~7.5 days
@@ -83,6 +86,10 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::TotalPooled)
             .unwrap_or(0i128)
+    }
+
+    fn read_lending_pool(env: &Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::LendingPool)
     }
 
     fn check_not_paused(env: &Env) -> Result<(), EscrowError> {
