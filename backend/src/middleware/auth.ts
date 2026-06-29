@@ -9,7 +9,11 @@ export interface AuthenticatedRequest extends Request {
 }
 
 export function authMiddleware(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  const token = req.cookies?.token;
+  // Accept token from HTTP-only cookie or Authorization: Bearer <token> header
+  const authHeader = req.headers.authorization;
+  const token =
+    req.cookies?.token ||
+    (authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined);
 
   if (!token) {
     res.status(401).json({ error: "unauthorized", message: "Authentication token missing" });

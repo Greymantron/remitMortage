@@ -16,6 +16,7 @@ import { analyticsRouter } from "./routes/analytics.js";
 import { auditRouter } from "./routes/audit.js";
 import { errorHandler } from "./middleware/errorHandler.js";
 import { requestLogger } from "./middleware/requestLogger.js";
+import { authMiddleware } from "./middleware/auth.js";
 import { startEventListener } from "./services/eventListener.js";
 import { startNotificationScheduler } from "./services/notification.js";
 import { startScheduler } from "./jobs/scheduler.js";
@@ -64,8 +65,8 @@ const verificationLimiter = rateLimit({
 // ── Routes ──────────────────────────────────────────────────────────────
 app.use("/api/health", healthRouter);
 app.use("/api/verification", verificationLimiter, verificationRouter);
-app.use("/api/borrower", borrowerRouter);
-app.use("/api/loan", loanRouter);
+app.use("/api/borrower", authMiddleware, borrowerRouter);
+app.use("/api/loan", authMiddleware, loanRouter);
 app.use("/api/milestone", milestoneRouter);
 app.use("/api/analytics", analyticsRouter);
 app.use("/api/audit-logs", auditRouter);
