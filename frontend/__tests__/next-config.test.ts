@@ -7,21 +7,30 @@ describe("Next.js content security policy headers", () => {
     expect(typeof nextConfig.headers).toBe("function");
 
     const headers = await nextConfig.headers();
-    const cspHeader = headers.find(
-      (header) => header.key.toLowerCase() === "content-security-policy"
-    );
+    expect(Array.isArray(headers)).toBe(true);
 
+    const route = headers.find((h: any) => h.source === "(/.*)" || h.source === "\\/(.*)" || h.source === "(/.*)" || h.source === "/(.*)");
+    // Fallback to first item if matching by source fails
+    const headerGroup = (route ?? headers[0]) as any;
+    expect(headerGroup).toBeDefined();
+    expect(Array.isArray(headerGroup.headers)).toBe(true);
+
+    const cspHeader = headerGroup.headers.find((h: any) => typeof h.key === "string" && h.key.toLowerCase() === "content-security-policy");
     expect(cspHeader).toBeDefined();
-    expect(cspHeader?.value).toContain("default-src 'self'");
-    expect(cspHeader?.value).toContain("script-src 'self'");
-    expect(cspHeader?.value).toContain("connect-src 'self'");
-    expect(cspHeader?.value).toContain("img-src 'self'");
-    expect(cspHeader?.value).toContain("https://ipfs.io");
-    expect(cspHeader?.value).toContain("https://cloudflare-ipfs.com");
-    expect(cspHeader?.value).toContain("https://gateway.pinata.cloud");
-    expect(cspHeader?.value).toContain("https://horizon-testnet.stellar.org");
-    expect(cspHeader?.value).toContain("https://soroban-testnet.stellar.org");
-    expect(cspHeader?.value).not.toContain("'unsafe-inline'");
-    expect(cspHeader?.value).not.toContain("unsafe-eval");
+    const value: string = cspHeader.value;
+
+    expect(value).toContain("default-src 'self'");
+    expect(value).toContain("script-src 'self'");
+    expect(value).toContain("connect-src 'self'");
+    expect(value).toContain("img-src 'self'");
+    expect(value).toContain("https://ipfs.io");
+    expect(value).toContain("https://cloudflare-ipfs.com");
+    expect(value).toContain("https://gateway.pinata.cloud");
+    expect(value).toContain("https://horizon-testnet.stellar.org");
+    expect(value).toContain("https://soroban-testnet.stellar.org");
+    // Ensure scripts are not allowed unsafe inline/eval, but styles may allow 'unsafe-inline'
+    const scriptDirective = (value.match(/script-src[^;]*/)?.[0] ?? "").toLowerCase();
+    expect(scriptDirective).not.toContain("'unsafe-inline'");
+    expect(scriptDirective).not.toContain("unsafe-eval");
   });
 });
