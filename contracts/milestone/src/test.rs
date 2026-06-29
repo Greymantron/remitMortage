@@ -31,6 +31,7 @@ mod mockpool {
         Cap,
         Disbursed,
         Refunded,
+        LoanBorrower(BytesN<32>),
     }
 
     #[contract]
@@ -97,6 +98,16 @@ mod mockpool {
 
         pub fn total_refunded(env: Env) -> i128 {
             env.storage().instance().get(&MKey::Refunded).unwrap_or(0)
+        }
+
+        pub fn set_loan_borrower(env: Env, loan_id: BytesN<32>, borrower: Address) {
+            env.storage()
+                .instance()
+                .set(&MKey::LoanBorrower(loan_id), &borrower);
+        }
+
+        pub fn get_loan_borrower(env: Env, loan_id: BytesN<32>) -> Option<Address> {
+            env.storage().instance().get(&MKey::LoanBorrower(loan_id))
         }
     }
 }
@@ -244,6 +255,50 @@ fn test_propose_milestone_creates_record() {
     assert_eq!(record.amount, 1_000i128);
     assert_eq!(record.votes, 0);
     assert_eq!(record.evidence_hash, evidence(&env));
+}
+
+#[test]
+fn test_propose_self_dealing_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let h = setup(&env, 2, 2, 5_000, 10_000);
+
+    let borrower = Address::generate(&env);
+    h.pool.set_loan_borrower(&loan_id(&env), &borrower);
+
+    let res = h.milestone.try_propose_milestone(
+        &borrower,
+        &proposal_id(&env),
+        &loan_id(&env),
+        &1_000i128,
+        &evidence(&env),
+        &cidv0(&env),
+    );
+    assert_eq!(res, Err(Ok(MilestoneError::SelfDealingNotAllowed)));
+}
+
+#[test]
+fn test_propose_non_self_dealing_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let h = setup(&env, 2, 2, 5_000, 10_000);
+
+    let borrower = Address::generate(&env);
+    let contractor = Address::generate(&env);
+    h.pool.set_loan_borrower(&loan_id(&env), &borrower);
+
+    h.milestone.propose_milestone(
+        &contractor,
+        &proposal_id(&env),
+        &loan_id(&env),
+        &1_000i128,
+        &evidence(&env),
+        &cidv0(&env),
+    );
+
+    let record = h.milestone.get_milestone(&proposal_id(&env));
+    assert_eq!(record.contractor, contractor);
+    assert_eq!(record.status, MilestoneStatus::Proposed);
 }
 
 #[test]

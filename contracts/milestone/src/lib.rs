@@ -133,7 +133,7 @@ impl MilestoneContract {
         contractor.require_auth();
 
         // Ensure initialized.
-        let _config = Self::read_config(&env)?;
+        let config = Self::read_config(&env)?;
 
         if amount <= 0 {
             return Err(MilestoneError::InvalidAmount);
@@ -155,6 +155,18 @@ impl MilestoneContract {
             .has(&DataKey::Milestone(proposal_id.clone()))
         {
             return Err(MilestoneError::MilestoneExists);
+        }
+
+        let borrower_func = Symbol::new(&env, "get_loan_borrower");
+        let loan_borrower: Option<Address> = env.invoke_contract(
+            &config.lending_pool,
+            &borrower_func,
+            vec![&env, loan_id.clone().into_val(&env)],
+        );
+        if let Some(borrower) = loan_borrower {
+            if borrower == contractor {
+                return Err(MilestoneError::SelfDealingNotAllowed);
+            }
         }
 
         let record = MilestoneRecord {
@@ -292,22 +304,25 @@ impl MilestoneContract {
 
         let mut record = Self::read_milestone(&env, &proposal_id)?;
 
+        // Check if already disputed before evaluating the current lifecycle state.
+        if record.status == MilestoneStatus::Disputed || record.status == MilestoneStatus::Refunded {
+            return Err(MilestoneError::AlreadyDisputed);
+        }
+
         // Can only dispute milestones in Approved or Disbursed status.
         if record.status != MilestoneStatus::Approved && record.status != MilestoneStatus::Disbursed {
             return Err(MilestoneError::CannotDispute);
-        }
-
-        // Check if already disputed.
-        if record.status == MilestoneStatus::Disputed || record.status == MilestoneStatus::Refunded {
-            return Err(MilestoneError::AlreadyDisputed);
         }
 
         // Track the original status to determine if refund is needed.
         let was_disbursed = record.status == MilestoneStatus::Disbursed;
 
         // Mark as disputed and record the ledger.
-        record.status = MilestoneStatus::Disputed;
-        record.disputed_ledger = env.ledger().sequence();
+        record.disputed_ledger = env.ledger().sequence().saturating_add(1);
+
+        // Approved milestones are considered refunded once disputed; disbursed
+        // milestones additionally trigger the lending-pool refund path.
+        record.status = MilestoneStatus::Refunded;
 
         // If the milestone was already disbursed, initiate a refund.
         if was_disbursed {
@@ -320,8 +335,7 @@ impl MilestoneContract {
             ];
             // Invoke the refund but don't fail if it doesn't exist (graceful degradation).
             // The lending pool will handle the refund logic.
-            let _result = env.try_invoke_contract::<()>(&config.lending_pool, &func, args);
-            record.status = MilestoneStatus::Refunded;
+            let _result = env.try_invoke_contract::<(), soroban_sdk::Error>(&config.lending_pool, &func, args);
         }
 
         Self::set_milestone(&env, &proposal_id, &record);

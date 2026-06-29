@@ -325,6 +325,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "disputed_ledger"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "evidence_hash"
                       },
                       "val": {
@@ -634,6 +642,21 @@
                           "vec": [
                             {
                               "symbol": "Disbursed"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 0
+                          }
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Refunded"
                             }
                           ]
                         },

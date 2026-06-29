@@ -34,4 +34,6 @@ pub enum MilestoneError {
     CannotDispute = 14,
     /// Refund operation failed (cross-contract call to lending pool).
     RefundFailed = 15,
+    /// Contractor cannot also be the borrower for the same loan.
+    SelfDealingNotAllowed = 16,
 }
