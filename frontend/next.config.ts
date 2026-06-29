@@ -23,6 +23,16 @@ const contentSecurityPolicy = [
   "form-action 'self'",
 ].join("; ");
 
+// CSP reporting endpoint path
+const CSP_REPORT_PATH = "/api/csp/report";
+
+const reportTo = JSON.stringify({
+  group: "csp-endpoint",
+  max_age: 10886400,
+  endpoints: [{ url: CSP_REPORT_PATH }],
+  include_subdomains: true,
+});
+
 const nextConfig: NextConfig = {
   turbopack: {
     root: process.cwd(),
@@ -34,7 +44,11 @@ const nextConfig: NextConfig = {
         headers: [
           {
             key: "Content-Security-Policy",
-            value: contentSecurityPolicy,
+            value: `${contentSecurityPolicy}; report-uri ${CSP_REPORT_PATH}; report-to csp-endpoint`,
+          },
+          {
+            key: "Report-To",
+            value: reportTo,
           },
         ],
       },

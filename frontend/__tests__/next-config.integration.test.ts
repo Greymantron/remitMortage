@@ -34,5 +34,10 @@ describe("Next config headers integration", () => {
     expect(csp).toContain("script-src 'self'");
     expect(csp).toContain("connect-src 'self'");
     expect(csp).toContain("img-src 'self'");
+    // Ensure reporting headers are present
+    expect(csp).toContain('report-uri /api/csp/report');
+    const reportTo = res.header['report-to'];
+    expect(reportTo).toBeDefined();
+    expect(reportTo).toContain('csp-endpoint');
   });
 });
