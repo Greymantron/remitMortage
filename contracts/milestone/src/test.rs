@@ -30,6 +30,7 @@ mod mockpool {
         Token,
         Cap,
         Disbursed,
+        Refunded,
     }
 
     #[contract]
@@ -42,6 +43,7 @@ mod mockpool {
             env.storage().instance().set(&MKey::Token, &token);
             env.storage().instance().set(&MKey::Cap, &cap);
             env.storage().instance().set(&MKey::Disbursed, &0i128);
+            env.storage().instance().set(&MKey::Refunded, &0i128);
         }
 
         pub fn disburse(
@@ -73,8 +75,28 @@ mod mockpool {
             Ok(())
         }
 
+        pub fn refnd_ms(
+            env: Env,
+            _loan_id: BytesN<32>,
+            amount: i128,
+        ) -> Result<(), MockPoolError> {
+            // Only the configured admin (the milestone contract) may refund.
+            let admin: Address = env.storage().instance().get(&MKey::Admin).unwrap();
+            admin.require_auth();
+
+            let refunded: i128 = env.storage().instance().get(&MKey::Refunded).unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&MKey::Refunded, &(refunded + amount));
+            Ok(())
+        }
+
         pub fn total_disbursed(env: Env) -> i128 {
             env.storage().instance().get(&MKey::Disbursed).unwrap_or(0)
+        }
+
+        pub fn total_refunded(env: Env) -> i128 {
+            env.storage().instance().get(&MKey::Refunded).unwrap_or(0)
         }
     }
 }
@@ -559,4 +581,200 @@ fn test_approve_requires_caller_auth() {
     h.env.set_auths(&[]);
     h.milestone
         .approve_milestone(&h.approvers.get(0).unwrap(), &proposal_id(&env));
+}
+
+// ── Dispute Resolution ────────────────────────────────────────────────
+
+#[test]
+fn test_dispute_approved_milestone() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let h = setup(&env, 2, 2, 5_000, 10_000);
+
+    let pid = proposal_id(&env);
+    h.milestone.propose_milestone(
+        &h.contractor,
+        &pid,
+        &loan_id(&env),
+        &1_000i128,
+        &evidence(&env),
+        &cidv0(&env),
+    );
+
+    // Reach approval threshold
+    h.milestone
+        .approve_milestone(&h.approvers.get(0).unwrap(), &pid);
+    h.milestone
+        .approve_milestone(&h.approvers.get(1).unwrap(), &pid);
+
+    let record = h.milestone.get_milestone(&pid);
+    assert_eq!(record.status, MilestoneStatus::Approved);
+
+    // First approver disputes the milestone
+    h.milestone
+        .dispute_milestone(&h.approvers.get(0).unwrap(), &pid);
+
+    let record = h.milestone.get_milestone(&pid);
+    assert_eq!(record.status, MilestoneStatus::Refunded);
+    assert!(record.disputed_ledger > 0);
+}
+
+#[test]
+fn test_dispute_disbursed_milestone() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amount = 1_000i128;
+    let h = setup(&env, 2, 2, 5_000, 10_000);
+
+    let pid = proposal_id(&env);
+    h.milestone.propose_milestone(
+        &h.contractor,
+        &pid,
+        &loan_id(&env),
+        &amount,
+        &evidence(&env),
+        &cidv0(&env),
+    );
+
+    // Reach approval and then release
+    h.milestone
+        .approve_milestone(&h.approvers.get(0).unwrap(), &pid);
+    h.milestone
+        .approve_milestone(&h.approvers.get(1).unwrap(), &pid);
+
+    env.ledger().set_sequence_number(100);
+    h.milestone.release_milestone(&pid);
+
+    let record = h.milestone.get_milestone(&pid);
+    assert_eq!(record.status, MilestoneStatus::Disbursed);
+    assert_eq!(h.pool.total_disbursed(), amount);
+
+    // Governance disputes the disbursed milestone
+    h.milestone
+        .dispute_milestone(&h.approvers.get(0).unwrap(), &pid);
+
+    let record = h.milestone.get_milestone(&pid);
+    assert_eq!(record.status, MilestoneStatus::Refunded);
+    assert_eq!(h.pool.total_refunded(), amount);
+}
+
+#[test]
+fn test_cannot_dispute_proposed_milestone() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let h = setup(&env, 2, 2, 5_000, 10_000);
+
+    let pid = proposal_id(&env);
+    h.milestone.propose_milestone(
+        &h.contractor,
+        &pid,
+        &loan_id(&env),
+        &1_000i128,
+        &evidence(&env),
+        &cidv0(&env),
+    );
+
+    // Cannot dispute a milestone that is still Proposed
+    let res = h.milestone
+        .try_dispute_milestone(&h.approvers.get(0).unwrap(), &pid);
+    assert_eq!(res, Err(Ok(MilestoneError::CannotDispute)));
+}
+
+#[test]
+fn test_cannot_dispute_already_refunded_milestone() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let h = setup(&env, 2, 2, 5_000, 10_000);
+
+    let pid = proposal_id(&env);
+    h.milestone.propose_milestone(
+        &h.contractor,
+        &pid,
+        &loan_id(&env),
+        &1_000i128,
+        &evidence(&env),
+        &cidv0(&env),
+    );
+
+    // Approve milestone
+    h.milestone
+        .approve_milestone(&h.approvers.get(0).unwrap(), &pid);
+    h.milestone
+        .approve_milestone(&h.approvers.get(1).unwrap(), &pid);
+
+    // First dispute succeeds
+    h.milestone
+        .dispute_milestone(&h.approvers.get(0).unwrap(), &pid);
+
+    let record = h.milestone.get_milestone(&pid);
+    assert_eq!(record.status, MilestoneStatus::Refunded);
+
+    // Second dispute fails
+    let res = h.milestone
+        .try_dispute_milestone(&h.approvers.get(1).unwrap(), &pid);
+    assert_eq!(res, Err(Ok(MilestoneError::AlreadyDisputed)));
+}
+
+#[test]
+fn test_dispute_requires_governance_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let h = setup(&env, 2, 2, 5_000, 10_000);
+
+    let pid = proposal_id(&env);
+    h.milestone.propose_milestone(
+        &h.contractor,
+        &pid,
+        &loan_id(&env),
+        &1_000i128,
+        &evidence(&env),
+        &cidv0(&env),
+    );
+
+    // Approve milestone
+    h.milestone
+        .approve_milestone(&h.approvers.get(0).unwrap(), &pid);
+    h.milestone
+        .approve_milestone(&h.approvers.get(1).unwrap(), &pid);
+
+    // Non-approver cannot dispute
+    let unauthorized = Address::generate(&env);
+    let res = h.milestone
+        .try_dispute_milestone(&unauthorized, &pid);
+    assert_eq!(res, Err(Ok(MilestoneError::Unauthorized)));
+}
+
+#[test]
+fn test_disputed_milestone_prevents_release() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let h = setup(&env, 2, 2, 5_000, 10_000);
+
+    let pid = proposal_id(&env);
+    h.milestone.propose_milestone(
+        &h.contractor,
+        &pid,
+        &loan_id(&env),
+        &1_000i128,
+        &evidence(&env),
+        &cidv0(&env),
+    );
+
+    // Approve milestone
+    h.milestone
+        .approve_milestone(&h.approvers.get(0).unwrap(), &pid);
+    h.milestone
+        .approve_milestone(&h.approvers.get(1).unwrap(), &pid);
+
+    // Dispute before release
+    h.milestone
+        .dispute_milestone(&h.approvers.get(0).unwrap(), &pid);
+
+    let record = h.milestone.get_milestone(&pid);
+    assert_eq!(record.status, MilestoneStatus::Refunded);
+
+    // Attempt to release should fail because it's no longer Approved
+    env.ledger().set_sequence_number(100);
+    let res = h.milestone.try_release_milestone(&pid);
+    assert_eq!(res, Err(Ok(MilestoneError::InvalidStatus)));
 }

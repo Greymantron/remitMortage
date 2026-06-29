@@ -26,6 +26,8 @@ pub enum MilestoneStatus {
     Proposed = 0,
     Approved = 1,
     Disbursed = 2,
+    Disputed = 3,
+    Refunded = 4,
 }
 
 /// Milestone record stored on-chain.
@@ -50,6 +52,8 @@ pub struct MilestoneRecord {
     pub created_ledger: u32,
     /// Ledger sequence at which the milestone was approved and the timelock began.
     pub approved_ledger: u32,
+    /// Ledger sequence at which the milestone was disputed (0 if not disputed).
+    pub disputed_ledger: u32,
 }
 
 /// Storage keys for the milestone contract.

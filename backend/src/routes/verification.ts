@@ -1,6 +1,8 @@
 import { Router } from "express";
 import crypto from "crypto";
+import jwt from "jsonwebtoken";
 import { Keypair } from "@stellar/stellar-sdk";
+import logger from "../utils/logger.js";
 import { analyzeRemittanceHistory } from "../services/stellar.js";
 import { hashReportContent, streamVerificationPdf, VerificationReport } from "../services/pdf.js";
 import { calculateCreditScore } from "../services/scoring.js";
@@ -83,7 +85,7 @@ verificationRouter.post("/check", validateVerificationBody, async (req, res) => 
 
     res.json({ ...analysis, reportId, generatedAt, reportHash });
   } catch (error) {
-    console.error("Verification error:", error);
+    logger.error("Verification error", { error });
     res.status(500).json({ error: "Verification service failed" });
   }
 });
@@ -151,7 +153,7 @@ verificationRouter.get("/report/:reportId", (req, res) => {
 
     streamVerificationPdf(report, res);
   } catch (error) {
-    console.error("PDF generation error:", error);
+    logger.error("PDF generation error", { error });
     res.status(500).json({ error: "PDF generation failed" });
   }
 });
@@ -186,7 +188,7 @@ verificationRouter.post("/score", validateVerificationBody, async (req, res) => 
     const scoreResult = calculateCreditScore(analysisResult);
     res.json(scoreResult);
   } catch (error) {
-    console.error("Scoring error:", error);
+    logger.error("Scoring error", { error });
     res.status(500).json({ error: "Scoring service failed" });
   }
 });
@@ -290,6 +292,19 @@ verificationRouter.post("/verify-ownership", verificationOwnershipRateLimiter, v
     res.status(401).json({ error: "invalid_signature" });
     return;
   }
+
+  const token = jwt.sign(
+    { walletAddress, network },
+    process.env.JWT_SECRET || "default_jwt_secret",
+    { expiresIn: "24h" }
+  );
+
+  res.cookie("token", token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "strict",
+    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+  });
 
   res.json({ verified: true, walletAddress, network });
 });

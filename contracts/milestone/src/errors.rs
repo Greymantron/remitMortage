@@ -28,4 +28,10 @@ pub enum MilestoneError {
     InvalidCidFormat = 11,
     /// The minimum timelock between approval and release has not elapsed yet.
     TimelockNotElapsed = 12,
+    /// Milestone is already disputed and cannot be disputed again.
+    AlreadyDisputed = 13,
+    /// Milestone cannot be disputed in its current status (only Approved/Disbursed).
+    CannotDispute = 14,
+    /// Refund operation failed (cross-contract call to lending pool).
+    RefundFailed = 15,
 }

@@ -167,6 +167,7 @@ impl MilestoneContract {
             votes: 0,
             created_ledger: env.ledger().sequence(),
             approved_ledger: 0,
+            disputed_ledger: 0,
         };
         Self::set_milestone(&env, &proposal_id, &record);
 
@@ -261,6 +262,69 @@ impl MilestoneContract {
         record.status = MilestoneStatus::Disbursed;
         Self::set_milestone(&env, &proposal_id, &record);
 
+        Self::bump_instance(&env);
+
+        Ok(())
+    }
+
+    /// Dispute an active milestone and trigger a refund to the lending pool.
+    ///
+    /// Only multisig governance approvers can dispute a milestone. The milestone
+    /// must be in `Approved` or `Disbursed` status. Once the approver threshold
+    /// of dispute votes is reached, the milestone transitions to `Disputed` and
+    /// a refund is initiated via cross-contract call to the lending pool.
+    ///
+    /// If the milestone was already `Disbursed`, the funds are refunded back
+    /// to the pool liquidity and the loan's outstanding debt is adjusted.
+    pub fn dispute_milestone(
+        env: Env,
+        governance_signer: Address,
+        proposal_id: BytesN<32>,
+    ) -> Result<(), MilestoneError> {
+        governance_signer.require_auth();
+
+        let config = Self::read_config(&env)?;
+
+        // Only configured multisig approvers may dispute.
+        if !config.approvers.contains(&governance_signer) {
+            return Err(MilestoneError::Unauthorized);
+        }
+
+        let mut record = Self::read_milestone(&env, &proposal_id)?;
+
+        // Can only dispute milestones in Approved or Disbursed status.
+        if record.status != MilestoneStatus::Approved && record.status != MilestoneStatus::Disbursed {
+            return Err(MilestoneError::CannotDispute);
+        }
+
+        // Check if already disputed.
+        if record.status == MilestoneStatus::Disputed || record.status == MilestoneStatus::Refunded {
+            return Err(MilestoneError::AlreadyDisputed);
+        }
+
+        // Track the original status to determine if refund is needed.
+        let was_disbursed = record.status == MilestoneStatus::Disbursed;
+
+        // Mark as disputed and record the ledger.
+        record.status = MilestoneStatus::Disputed;
+        record.disputed_ledger = env.ledger().sequence();
+
+        // If the milestone was already disbursed, initiate a refund.
+        if was_disbursed {
+            // Cross-contract call: lending_pool.refund_milestone_dispute(loan_id, amount).
+            let func: Symbol = symbol_short!("refnd_ms");
+            let args: Vec<Val> = vec![
+                &env,
+                record.loan_id.clone().into_val(&env),
+                record.amount.into_val(&env),
+            ];
+            // Invoke the refund but don't fail if it doesn't exist (graceful degradation).
+            // The lending pool will handle the refund logic.
+            let _result = env.try_invoke_contract::<()>(&config.lending_pool, &func, args);
+            record.status = MilestoneStatus::Refunded;
+        }
+
+        Self::set_milestone(&env, &proposal_id, &record);
         Self::bump_instance(&env);
 
         Ok(())

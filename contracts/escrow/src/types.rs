@@ -70,4 +70,7 @@ pub enum DataKey {
     Paused,
     /// Pending new admin address for two-step admin transfer.
     PendingAdmin,
+    /// Optional LendingPool contract address that early-exit penalty fees are
+    /// routed to as investor yield. Unset means penalties stay in the contract.
+    LendingPool,
 }
