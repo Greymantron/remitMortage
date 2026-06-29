@@ -12,23 +12,32 @@ enum NotificationStatus {
   Failed
 }
 
+enum LoanStatus {
+  Pending
+  Approved
+  Rejected
+  Disbursing
+  Repaying
+  Completed
+}
+
 model Notification {
-  id        String             @id @default(uuid())
-  recipient String
-  type      String             // "EMAIL" or "WEBHOOK"
-  content   String             // HTML for emails or JSON payload for webhooks
-  status    NotificationStatus @default(Pending)
-  createdAt DateTime           @default(now())
-  updatedAt DateTime           @updatedAt
-  attempts  Int                @default(0)
-  lastError String?
+  id          String             @id @default(uuid())
+  recipient   String
+  type        String // "EMAIL" or "WEBHOOK"
+  content     String // HTML for emails or JSON payload for webhooks
+  status      NotificationStatus @default(Pending)
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+  attempts    Int                @default(0)
+  lastError   String?
   nextRetryAt DateTime?
 }
 
 model UnpinnedCid {
   id           String   @id @default(uuid())
   cid          String
-  proposalId     String?
+  proposalId   String?
   success      Boolean
   pinataStatus Int?
   error        String?

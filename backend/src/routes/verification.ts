@@ -19,12 +19,6 @@ import { upsertApplicant, createVerificationResult } from "../services/db.js";
 export const verificationRouter = Router();
 
 /**
- * Simple in-memory store keyed by reportId.
- * In production this should be replaced by a persistent database (PostgreSQL).
- */
-const reportStore = new Map<string, VerificationReport>();
-
-/**
  * @openapi
  * /api/verification/check:
  *   post:
@@ -131,17 +125,26 @@ verificationRouter.post("/check", validateVerificationBody, async (req, res) => 
  *             schema:
  *               $ref: '#/components/schemas/ErrorResponse'
  */
-verificationRouter.get("/report/:reportId", (req, res) => {
+verificationRouter.get("/report/:reportId", async (req, res) => {
   try {
     const { reportId } = req.params;
-    const report = reportStore.get(reportId);
+    const record = await prisma.verificationResult.findUnique({
+      where: { id: reportId },
+    });
 
-    if (!report) {
+    if (!record) {
       return res.status(404).json({
         error: "report_not_found",
         message: `No report found for ID: ${reportId}`,
       });
     }
+
+    const report: VerificationReport = {
+      reportId: record.id,
+      generatedAt: record.generatedAt.toISOString(),
+      analysis: record.analysis as any,
+      reportHash: record.reportHash,
+    };
 
     const filename = `remitmortgage-verification-${reportId.slice(0, 8)}.pdf`;
 
