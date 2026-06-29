@@ -3,19 +3,28 @@
 mod errors;
 mod types;
 
+#[cfg(test)]
+mod fuzz;
+
 pub use crate::errors::PoolError;
-pub use crate::types::{DataKey, InvestorRecord, LoanRecord, LoanStatus, PendingUpgradeRecord, PoolConfig, RepaymentSchedule, Tranche, TrancheInfo};
+pub use crate::types::{DataKey, InvestorRecord, LoanRecord, LoanStatus, PendingUpgradeRecord, PoolConfig, PoolHealth, RepaymentSchedule, Tranche, TrancheInfo};
 use soroban_sdk::{contract, contractimpl, symbol_short, Symbol, token, Address, BytesN, Env};
+use verification_registry::VerificationRegistryContractClient;
 
 const INSTANCE_BUMP_AMOUNT: u32 = 518_400; // ~30 days
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 129_600; // ~7.5 days
 
 // Ledger durations used for repayment scheduling
 const LEDGERS_PER_MONTH: u32 = 518_400; // ~30 days
+#[cfg(not(test))]
+const LEDGERS_PER_DAY: u32 = 17_280; // ~1 day
+#[cfg(test)]
+const LEDGERS_PER_DAY: u32 = 100;
 const GRACE_PERIOD_LEDGERS: u32 = 120_960; // ~7 days
 const LATE_PENALTY_BPS: u32 = 50; // 50 bps = 0.5%
 const DEFAULT_DURATION_MONTHS: u32 = 12;
 const DEFAULT_MISSED_THRESHOLD: u32 = 3; // default after 3 missed payments
+const DEFAULT_OVERDUE_LEDGERS: u32 = 3 * LEDGERS_PER_MONTH; // ~90 days past due
 
 // ── Dynamic Fee Structure Constants ──────────────────────────────────
 /// Basis points scale (10000 = 100%).
@@ -126,6 +135,33 @@ impl LendingPoolContract {
             .unwrap_or(0i128)
     }
 
+    fn read_total_defaulted_loss(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalDefaultedLoss)
+            .unwrap_or(0i128)
+    }
+
+    fn set_total_defaulted_loss(env: &Env, loss: i128) {
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalDefaultedLoss, &loss);
+    }
+
+    fn read_defaulted_count(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DefaultedLoanCount)
+            .unwrap_or(0u32)
+    }
+
+    fn read_loan_count(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::LoanCount)
+            .unwrap_or(0u32)
+    }
+
     fn read_total_withdrawal_fees(env: &Env) -> i128 {
         env.storage()
             .instance()
@@ -140,10 +176,26 @@ impl LendingPoolContract {
             .ok_or(PoolError::LoanNotFound)
     }
 
+    /// Returns the configured VerificationRegistry address, if one has been set.
+    ///
+    /// `None` means no registry has been configured yet, in which case the
+    /// verification gate in `do_request_loan` is skipped (opt-in gating).
+    fn read_verification_registry(env: &Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::VerificationRegistry)
+    }
+
     fn set_loan(env: &Env, loan_id: &BytesN<32>, record: &LoanRecord) {
         env.storage()
             .persistent()
             .set(&DataKey::Loan(loan_id.clone()), record);
+    }
+
+    /// Returns whether `contractor` is on the disbursement whitelist.
+    fn is_contractor_whitelisted(env: &Env, contractor: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Whitelist(contractor.clone()))
+            .unwrap_or(false)
     }
 
     fn token_client<'a>(env: &'a Env, token_addr: &'a Address) -> token::Client<'a> {
@@ -218,12 +270,16 @@ impl LendingPoolContract {
     /// Utilization = active_loan_commitments / total_pool_liquidity
     /// Returns the rate in basis points (0-10000).
     fn calculate_utilization(env: &Env) -> u32 {
-        let total_liquidity = Self::read_total_liquidity(env);
-        if total_liquidity <= 0 {
+        let total_deposited = Self::read_total_deposited(env);
+        if total_deposited <= 0 {
             return 0;
         }
+        let total_liquidity = Self::read_total_liquidity(env);
         let active_commitments = Self::read_active_commitments(env);
-        let utilization = (active_commitments * BPS_SCALE as i128) / total_liquidity;
+        let utilized = active_commitments.saturating_add(
+            total_deposited.saturating_sub(total_liquidity).max(0),
+        );
+        let utilization = (utilized * BPS_SCALE as i128) / total_deposited;
         utilization.min(BPS_SCALE as i128) as u32
     }
 
@@ -263,6 +319,7 @@ impl LendingPoolContract {
         env: Env,
         admin: Address,
         token: Address,
+        escrow: Address,
         interest_rate_bps: u32,
         senior_rate_bps: u32,
         treasury_address: Address,
@@ -276,6 +333,7 @@ impl LendingPoolContract {
         let config = PoolConfig {
             admin,
             token,
+            escrow,
             interest_rate_bps,
             senior_rate_bps,
             treasury_address,
@@ -321,6 +379,7 @@ impl LendingPoolContract {
     pub fn deposit(env: Env, investor: Address, amount: i128, tranche: Tranche) -> Result<(), PoolError> {
         Self::check_not_paused(&env)?;
         investor.require_auth();
+        Self::non_reentrant(&env, || {
 
         if amount <= 0 {
             return Err(PoolError::InvalidAmount);
@@ -371,6 +430,56 @@ impl LendingPoolContract {
         );
 
         Ok(())
+        }) // non_reentrant
+    }
+
+    /// Deposit penalty/fee revenue into the pool and distribute it as yield.
+    ///
+    /// Pulls `amount` USDC from `from` and books it as distributable interest:
+    /// total liquidity rises (so the new tokens are claimable) and the
+    /// total-repaid-interest accumulator rises, which increases every active
+    /// depositor's pending yield pro-rata to their deposited share — exactly
+    /// the same mechanism used for loan-interest repayments.
+    ///
+    /// Designed for the escrow contract to route early-exit penalty fees here
+    /// rather than leaving them idle. `from` must authorize the transfer, so a
+    /// caller can only move its own funds.
+    pub fn deposit_fees(env: Env, from: Address, amount: i128) -> Result<(), PoolError> {
+        Self::check_not_paused(&env)?;
+        from.require_auth();
+
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+
+        let config = Self::read_config(&env)?;
+
+        // Pull the fee tokens into the pool.
+        let token = Self::token_client(&env, &config.token);
+        token.transfer(&from, &env.current_contract_address(), &amount);
+
+        // Book the fees as claimable liquidity.
+        let liquidity = Self::read_total_liquidity(&env) + amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalLiquidity, &liquidity);
+
+        // Distribute as yield pro-rata via the repaid-interest accumulator.
+        let total_interest = Self::read_total_repaid_interest(&env) + amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalRepaidInterest, &total_interest);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        env.events().publish(
+            (symbol_short!("dep_fees"),),
+            (from.clone(), amount, total_interest),
+        );
+
+        Ok(())
     }
 
     /// Borrower requests a loan for the given principal amount.
@@ -409,6 +518,16 @@ impl LendingPoolContract {
             return Err(PoolError::InvalidAmount);
         }
 
+        // Verification gate: if a VerificationRegistry has been configured,
+        // the borrower must have a valid, non-expired verification record
+        // before they can request a loan against pool liquidity.
+        if let Some(registry) = Self::read_verification_registry(env) {
+            let registry_client = VerificationRegistryContractClient::new(env, &registry);
+            if !registry_client.is_verified(&borrower) {
+                return Err(PoolError::ApplicantNotVerified);
+            }
+        }
+
         // Ensure loan ID doesn't already exist.
         if env
             .storage()
@@ -430,7 +549,10 @@ impl LendingPoolContract {
             created_ledger: env.ledger().sequence(),
             last_interest_ledger: env.ledger().sequence(),
             outstanding_debt: 0,
+            defaulted_ledger: 0,
             escrow_origin,
+            refinanced_at_ledger: None,
+            previous_rate_bps: None,
         };
 
         Self::set_loan(env, &loan_id, &loan);
@@ -518,6 +640,78 @@ impl LendingPoolContract {
         Ok(())
     }
 
+    /// Refinance an active loan to extend its term or adjust its interest rate.
+    pub fn refinance_loan(
+        env: Env,
+        loan_id: BytesN<32>,
+        new_interest_rate_bps: u32,
+        new_duration_months: u32,
+    ) -> Result<(), PoolError> {
+        Self::check_not_paused(&env)?;
+        let config = Self::read_config(&env)?;
+        config.admin.require_auth();
+
+        let mut loan = Self::read_loan(&env, &loan_id)?;
+
+        if loan.status != LoanStatus::Approved {
+            return Err(PoolError::InvalidLoanState);
+        }
+
+        if new_interest_rate_bps < 200 {
+            return Err(PoolError::InterestRateTooLow);
+        }
+
+        if !env.storage().persistent().has(&DataKey::LoanSchedule(loan_id.clone())) {
+            return Err(PoolError::RefinanceNotEligible);
+        }
+
+        let mut schedule: RepaymentSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LoanSchedule(loan_id.clone()))
+            .unwrap();
+
+        if schedule.payments_made < 3 {
+            return Err(PoolError::InsufficientPaymentHistory);
+        }
+
+        if schedule.payments_missed > 0 {
+            return Err(PoolError::RefinanceNotEligible);
+        }
+
+        // Accrue any outstanding compound interest before computing what is owed.
+        Self::accrue_interest(&env, &mut loan);
+
+        let remaining_principal = loan.outstanding_debt;
+        let new_interest = (remaining_principal * new_interest_rate_bps as i128) / 10_000;
+        let total_owed = remaining_principal + new_interest;
+
+        // Note: We use a simple unwrap or default to 1 to prevent division by zero
+        let duration = if new_duration_months > 0 { new_duration_months } else { 1 };
+        let monthly_amount = total_owed / (duration as i128);
+
+        schedule.monthly_amount = monthly_amount;
+        schedule.duration_months = new_duration_months;
+        schedule.payments_made = 0;
+        schedule.payments_missed = 0;
+
+        loan.previous_rate_bps = Some(loan.interest_rate_bps);
+        loan.refinanced_at_ledger = Some(env.ledger().sequence());
+        loan.interest_rate_bps = new_interest_rate_bps;
+
+        Self::set_loan(&env, &loan_id, &loan);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LoanSchedule(loan_id.clone()), &schedule);
+
+        env.events().publish(
+            (Symbol::new(&env, "loan_refinanced"),),
+            (loan_id.clone(), new_interest_rate_bps, new_duration_months),
+        );
+
+        Ok(())
+    }
+
     /// Disburse funds from the pool for an approved loan.
     ///
     /// Transfers the specified amount to the recipient (e.g., a contractor
@@ -536,6 +730,7 @@ impl LendingPoolContract {
 
         let config = Self::read_config(&env)?;
         config.admin.require_auth();
+        Self::non_reentrant(&env, || {
 
         let mut loan = Self::read_loan(&env, &loan_id)?;
 
@@ -552,6 +747,32 @@ impl LendingPoolContract {
         let liquidity = Self::read_total_liquidity(&env);
         if liquidity < amount {
             return Err(PoolError::InsufficientLiquidity);
+        }
+
+        // Enforce daily borrow limit if configured.
+        let limit: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DailyBorrowLimit)
+            .unwrap_or(0);
+        if limit > 0 {
+            let day_id = env.ledger().sequence() / LEDGERS_PER_DAY;
+            let current_day_borrowed: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::DailyBorrowed(day_id))
+                .unwrap_or(0);
+            if current_day_borrowed.saturating_add(amount) > limit {
+                return Err(PoolError::DailyBorrowLimitExceeded);
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::DailyBorrowed(day_id), &(current_day_borrowed + amount));
+        }
+
+        // Only vetted, whitelisted contractors may receive disbursements.
+        if !Self::is_contractor_whitelisted(&env, &recipient) {
+            return Err(PoolError::UnauthorizedContractor);
         }
 
         // Transfer funds to recipient.
@@ -583,6 +804,70 @@ impl LendingPoolContract {
         env.events().publish(
             (symbol_short!("disburse"),),
             (loan_id.clone(), recipient.clone(), amount),
+        );
+
+        Ok(())
+        }) // non_reentrant
+    }
+
+    /// Refund disputed milestone funds back to the pool.
+    ///
+    /// Called by the milestone contract when a milestone is disputed.
+    /// Reverses the disbursement by reducing the loan's disbursed amount and
+    /// outstanding debt, and returns funds to the pool's available liquidity.
+    ///
+    /// Only the admin (or milestone contract as authorized caller) can invoke this.
+    pub fn refund_milestone_dispute(
+        env: Env,
+        loan_id: BytesN<32>,
+        amount: i128,
+    ) -> Result<(), PoolError> {
+        Self::check_not_paused(&env)?;
+        
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+
+        let config = Self::read_config(&env)?;
+        config.admin.require_auth();
+
+        let mut loan = Self::read_loan(&env, &loan_id)?;
+
+        if loan.status != LoanStatus::Approved {
+            return Err(PoolError::InvalidLoanState);
+        }
+
+        // Cannot refund more than what has been disbursed.
+        if amount > loan.disbursed {
+            return Err(PoolError::RefundExceedsDisbursed);
+        }
+
+        // Reverse the disbursement.
+        loan.disbursed = loan.disbursed.saturating_sub(amount);
+        loan.outstanding_debt = loan.outstanding_debt.saturating_sub(amount);
+        Self::set_loan(&env, &loan_id, &loan);
+
+        // Return funds to available liquidity.
+        let liquidity = Self::read_total_liquidity(&env);
+        let new_liquidity = liquidity.saturating_add(amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalLiquidity, &new_liquidity);
+
+        // Restore active loan commitments (funds are back to available).
+        let active_commitments = Self::read_active_commitments(&env);
+        let restored_commitments = active_commitments.saturating_add(amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveLoanCommitments, &restored_commitments);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        env.events().publish(
+            (symbol_short!("refund"),),
+            (loan_id.clone(), amount),
         );
 
         Ok(())
@@ -667,10 +952,8 @@ impl LendingPoolContract {
                 // Advance next_due by missed_periods + 1 months (we cover current and skipped installments)
                 sched.next_due_ledger = sched.next_due_ledger + ((missed_periods + 1) * LEDGERS_PER_MONTH);
 
-                // If missed threshold reached, mark Defaulted
-                if sched.payments_missed >= DEFAULT_MISSED_THRESHOLD {
-                    loan.status = LoanStatus::Defaulted;
-                }
+                // If missed threshold reached, it becomes eligible for default marking
+                // which must be executed via `mark_default` to seize collateral.
             }
 
             // Persist schedule changes back to storage
@@ -781,12 +1064,44 @@ impl LendingPoolContract {
         Ok(())
     }
 
+
+    /// Trigger an on-chain liquidation for a defaulted loan.
+    /// Allocates the seized savings collateral to the lending pool to cover investor losses.
+    /// Returns true when an approved loan's repayment obligations are overdue
+    /// enough to justify a default: either the missed-payment threshold has been
+    /// reached, or the loan is more than ~90 days past its next due date.
+    fn is_loan_overdue(env: &Env, loan_id: &BytesN<32>) -> bool {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::LoanSchedule(loan_id.clone()))
+        {
+            return false;
+        }
+
+        let schedule: RepaymentSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LoanSchedule(loan_id.clone()))
+            .unwrap();
+
+        if schedule.payments_missed >= DEFAULT_MISSED_THRESHOLD {
+            return true;
+        }
+
+        let current = env.ledger().sequence();
+        current > schedule.next_due_ledger
+            && current - schedule.next_due_ledger >= DEFAULT_OVERDUE_LEDGERS
+    }
+
     /// Admin marks a loan as defaulted and applies the loss waterfall.
     ///
-    /// Junior tranche absorbs losses first. Senior tranche is only affected
-    /// once the junior tranche's total deposited capital is exhausted.
-    /// The outstanding loss is the difference between the disbursed amount
-    /// and the amount already repaid.
+    /// The loan must be Approved and overdue (3+ missed payments or ~90 days
+    /// past due). The outstanding loss (principal + accrued interest - repaid,
+    /// i.e. the compounded `outstanding_debt`) is recorded in
+    /// `DataKey::TotalDefaultedLoss` and absorbed by the tranches: the junior
+    /// tranche absorbs first, and the senior tranche only once junior capital is
+    /// exhausted. The defaulting ledger is stored on the loan for audit.
     pub fn mark_default(env: Env, loan_id: BytesN<32>) -> Result<(), PoolError> {
         Self::check_not_paused(&env)?;
         let config = Self::read_config(&env)?;
@@ -794,45 +1109,169 @@ impl LendingPoolContract {
 
         let mut loan = Self::read_loan(&env, &loan_id)?;
 
-        if loan.status != LoanStatus::Approved {
+        if loan.status == LoanStatus::Repaid || loan.status == LoanStatus::Cancelled {
             return Err(PoolError::InvalidLoanState);
+        }
+        if loan.status == LoanStatus::Defaulted {
+            return Err(PoolError::AlreadyDefaulted);
+        }
+
+        if !env.storage().persistent().has(&DataKey::LoanSchedule(loan_id.clone())) {
+            return Err(PoolError::InvalidLoanState);
+        }
+        if !Self::is_loan_overdue(&env, &loan_id) {
+            return Err(PoolError::LoanNotOverdue);
         }
 
         // Accrue any outstanding compound interest before computing the loss.
         Self::accrue_interest(&env, &mut loan);
 
-        // Outstanding loss = compound outstanding debt (not simple repaid check).
+        // Outstanding loss = principal + accrued interest - total repaid, which
+        // is tracked as the compounded outstanding debt.
         let loss = loan.outstanding_debt;
 
-        if loss > 0 {
-            let mut junior_info = Self::read_tranche_info(&env, &Tranche::Junior);
-            let mut senior_info = Self::read_tranche_info(&env, &Tranche::Senior);
-
-            // Junior absorbs first.
-            let junior_absorb = loss.min(junior_info.total_deposited);
-            junior_info.total_deposited -= junior_absorb;
-            junior_info.total_loss_absorbed += junior_absorb;
-
-            let senior_absorb = loss - junior_absorb;
-            if senior_absorb > 0 {
-                // Junior is exhausted — senior absorbs the remainder.
-                senior_info.total_deposited -= senior_absorb;
-                senior_info.total_loss_absorbed += senior_absorb;
-            }
-
-            Self::set_tranche_info(&env, &Tranche::Junior, &junior_info);
-            Self::set_tranche_info(&env, &Tranche::Senior, &senior_info);
-
-            // Reduce total liquidity by the loss (funds are permanently gone).
-            let liquidity = Self::read_total_liquidity(&env);
-            let new_liquidity = (liquidity - loss).max(0);
-            env.storage()
-                .instance()
-                .set(&DataKey::TotalLiquidity, &new_liquidity);
+        let sched: RepaymentSchedule = env.storage().persistent().get(&DataKey::LoanSchedule(loan_id.clone())).unwrap();
+        if sched.payments_missed < DEFAULT_MISSED_THRESHOLD {
+            return Err(PoolError::NotEligibleForDefault);
         }
 
+        // Seize collateral from escrow contract
+        // Invokes: escrow::seize_collateral(borrower, lending_pool_address)
+        let seized_amount: i128 = env.invoke_contract(
+            &config.escrow,
+            &soroban_sdk::Symbol::new(&env, "seize_collateral"),
+            soroban_sdk::vec![&env, loan.borrower.into_val(&env), env.current_contract_address().into_val(&env)],
+        );
+
+        // Reduce outstanding defaulted loss using the seized savings balance
+        loan.repaid += seized_amount;
         loan.status = LoanStatus::Defaulted;
         Self::set_loan(&env, &loan_id, &loan);
+
+        // Update lending pool total liquidity
+        let mut liquidity = Self::read_total_liquidity(&env);
+        liquidity += seized_amount;
+        env.storage().instance().set(&DataKey::TotalLiquidity, &liquidity);
+
+        // Release undisbursed active commitments
+        let undisbursed = loan.principal - loan.disbursed;
+        if undisbursed > 0 {
+            let active_commitments = Self::read_active_commitments(&env);
+            env.storage()
+                .instance()
+                .set(&DataKey::ActiveLoanCommitments, &(active_commitments - undisbursed));
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("default"),),
+            (loan_id.clone(), loan.borrower.clone(), seized_amount),
+        );
+                .set(&DataKey::TotalLiquidity, &new_liquidity);
+
+            // Record the realized loss for pool-health accounting.
+            let total_loss = Self::read_total_defaulted_loss(&env) + loss;
+            Self::set_total_defaulted_loss(&env, total_loss);
+        }
+
+        // Release the undisbursed portion of this loan's commitment.
+        let undisbursed = (loan.principal - loan.disbursed).max(0);
+        if undisbursed > 0 {
+            let commitments = Self::read_active_commitments(&env);
+            env.storage()
+                .instance()
+                .set(&DataKey::ActiveLoanCommitments, &(commitments - undisbursed).max(0));
+        }
+
+        // Increment the defaulted-loan counter for default-rate reporting.
+        let defaulted_count = Self::read_defaulted_count(&env) + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultedLoanCount, &defaulted_count);
+
+        loan.status = LoanStatus::Defaulted;
+        loan.defaulted_ledger = env.ledger().sequence();
+        Self::set_loan(&env, &loan_id, &loan);
+
+        env.events().publish(
+            (Symbol::new(&env, "loan_defaulted"),),
+            (loan_id.clone(), loss),
+        );
+
+        Ok(())
+    }
+
+    /// Admin deposits recovered funds (e.g. from property liquidation or
+    /// insurance) for a defaulted loan back into the pool. The recovered amount
+    /// increases pool liquidity, reduces the recorded default loss, and is
+    /// credited back to the tranches in reverse-waterfall order (senior first,
+    /// as it was the last to absorb the loss).
+    pub fn recover_default(
+        env: Env,
+        loan_id: BytesN<32>,
+        recovered_amount: i128,
+    ) -> Result<(), PoolError> {
+        Self::check_not_paused(&env)?;
+        let config = Self::read_config(&env)?;
+        config.admin.require_auth();
+
+        if recovered_amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+
+        let loan = Self::read_loan(&env, &loan_id)?;
+        if loan.status != LoanStatus::Defaulted {
+            return Err(PoolError::InvalidLoanState);
+        }
+
+        // Pull the recovered funds from the admin into the pool.
+        let token = Self::token_client(&env, &config.token);
+        token.transfer(
+            &config.admin,
+            &env.current_contract_address(),
+            &recovered_amount,
+        );
+
+        // Recovered funds become available liquidity again.
+        let liquidity = Self::read_total_liquidity(&env) + recovered_amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalLiquidity, &liquidity);
+
+        // Reduce the recorded loss, capped at the recovered amount.
+        let current_loss = Self::read_total_defaulted_loss(&env);
+        let reduction = recovered_amount.min(current_loss);
+        Self::set_total_defaulted_loss(&env, current_loss - reduction);
+
+        // Restore tranche capital in reverse-waterfall order: senior first.
+        if reduction > 0 {
+            let mut senior_info = Self::read_tranche_info(&env, &Tranche::Senior);
+            let mut junior_info = Self::read_tranche_info(&env, &Tranche::Junior);
+
+            let senior_restore = reduction.min(senior_info.total_loss_absorbed);
+            senior_info.total_deposited += senior_restore;
+            senior_info.total_loss_absorbed -= senior_restore;
+
+            let junior_restore = (reduction - senior_restore).min(junior_info.total_loss_absorbed);
+            junior_info.total_deposited += junior_restore;
+            junior_info.total_loss_absorbed -= junior_restore;
+
+            Self::set_tranche_info(&env, &Tranche::Senior, &senior_info);
+            Self::set_tranche_info(&env, &Tranche::Junior, &junior_info);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "default_recovered"),),
+            (loan_id.clone(), recovered_amount),
+        );
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
         Ok(())
     }
 
@@ -919,6 +1358,7 @@ impl LendingPoolContract {
         );
 
         Ok(())
+        }) // non_reentrant
     }
 
     /// Investor claims their proportional share of repaid interest.
@@ -989,6 +1429,40 @@ impl LendingPoolContract {
         Self::read_total_liquidity(&env)
     }
 
+    /// Returns aggregate pool-health metrics: liquidity, active loan
+    /// commitments, total/defaulted loan counts, net default loss, and the
+    /// derived default-rate and loss-ratio (both in basis points).
+    pub fn get_pool_health(env: Env) -> PoolHealth {
+        let total_liquidity = Self::read_total_liquidity(&env);
+        let active_loan_commitments = Self::read_active_commitments(&env);
+        let total_loans = Self::read_loan_count(&env);
+        let defaulted_loans = Self::read_defaulted_count(&env);
+        let total_defaulted_loss = Self::read_total_defaulted_loss(&env);
+        let total_deposited = Self::read_total_deposited(&env);
+
+        let default_rate_bps = if total_loans > 0 {
+            ((defaulted_loans as u64 * 10_000) / total_loans as u64) as u32
+        } else {
+            0
+        };
+
+        let loss_ratio_bps = if total_deposited > 0 {
+            ((total_defaulted_loss.max(0) as i128 * 10_000) / total_deposited) as u32
+        } else {
+            0
+        };
+
+        PoolHealth {
+            total_liquidity,
+            active_loan_commitments,
+            total_loans,
+            defaulted_loans,
+            total_defaulted_loss,
+            default_rate_bps,
+            loss_ratio_bps,
+        }
+    }
+
     /// Returns the maximum amount an investor can currently withdraw.
     pub fn get_available_withdrawal(env: Env, investor: Address) -> i128 {
         let record = Self::read_investor(&env, &investor);
@@ -1021,6 +1495,11 @@ impl LendingPoolContract {
     /// Returns a loan record by ID.
     pub fn get_loan_info(env: Env, loan_id: BytesN<32>) -> Result<LoanRecord, PoolError> {
         Self::read_loan(&env, &loan_id)
+    }
+
+    /// Returns the borrower for a loan, if the loan exists.
+    pub fn get_loan_borrower(env: Env, loan_id: BytesN<32>) -> Option<Address> {
+        Self::read_loan(&env, &loan_id).ok().map(|loan| loan.borrower)
     }
 
     /// Returns aggregate metrics for the specified tranche.
@@ -1161,6 +1640,128 @@ impl LendingPoolContract {
         Ok(())
     }
 
+    // ── Verification Registry ────────────────────────────────────────────
+
+    /// Set (or update) the VerificationRegistry contract address used to
+    /// gate `request_loan`. Admin-only.
+    ///
+    /// Once set, `request_loan` and `request_loan_with_origin` will reject
+    /// borrowers who do not have a valid, non-expired verification record
+    /// in the registry with `PoolError::ApplicantNotVerified`.
+    pub fn set_verification_registry(env: Env, registry: Address) -> Result<(), PoolError> {
+        let config = Self::read_config(&env)?;
+        config.admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::VerificationRegistry, &registry);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        env.events().publish(
+            (symbol_short!("set_vreg"),),
+            (registry,),
+        );
+
+        Ok(())
+    }
+
+    /// Returns the configured VerificationRegistry address, or `None` if
+    /// the verification gate has not been enabled.
+    pub fn get_verification_registry(env: Env) -> Option<Address> {
+        Self::read_verification_registry(&env)
+    }
+
+    /// Set the daily borrow limit. Admin-only.
+    /// A limit <= 0 means no limit.
+    pub fn set_daily_borrow_limit(env: Env, limit: i128) -> Result<(), PoolError> {
+        let config = Self::read_config(&env)?;
+        config.admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DailyBorrowLimit, &limit);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        env.events().publish(
+            (symbol_short!("set_limit"),),
+            (limit,),
+        );
+
+        Ok(())
+    }
+
+    /// Get the daily borrow limit.
+    pub fn get_daily_borrow_limit(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DailyBorrowLimit)
+            .unwrap_or(0)
+    }
+
+    /// Get the total amount borrowed in the current day's time window.
+    pub fn get_daily_borrowed(env: Env) -> i128 {
+        let day_id = env.ledger().sequence() / LEDGERS_PER_DAY;
+        env.storage()
+            .instance()
+            .get(&DataKey::DailyBorrowed(day_id))
+            .unwrap_or(0)
+    }
+
+    // ── Contractor Whitelist ─────────────────────────────────────────────
+
+    /// Add a contractor to the disbursement whitelist. Admin-only.
+    ///
+    /// Only whitelisted addresses can receive funds via `disburse`, per the
+    /// architecture's requirement that disbursements go to vetted real estate
+    /// companies, contractors, and suppliers.
+    pub fn add_contractor(env: Env, contractor: Address) -> Result<(), PoolError> {
+        let config = Self::read_config(&env)?;
+        config.admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Whitelist(contractor.clone()), &true);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        env.events().publish(
+            (symbol_short!("wl_add"),),
+            (contractor,),
+        );
+
+        Ok(())
+    }
+
+    /// Remove a contractor from the disbursement whitelist. Admin-only.
+    pub fn remove_contractor(env: Env, contractor: Address) -> Result<(), PoolError> {
+        let config = Self::read_config(&env)?;
+        config.admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Whitelist(contractor.clone()));
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        env.events().publish(
+            (symbol_short!("wl_rm"),),
+            (contractor,),
+        );
+
+        Ok(())
+    }
+
+    /// Returns whether `contractor` is on the disbursement whitelist.
+    pub fn is_whitelisted(env: Env, contractor: Address) -> bool {
+        Self::is_contractor_whitelisted(&env, &contractor)
+    }
+
     // ── Upgrade Functions ────────────────────────────────────────────────
 
     /// Set the number of ledgers that must elapse between proposing and
@@ -1299,7 +1900,21 @@ mod test {
     };
 
     /// Helper: deploy test token, mint to investor, initialize pool.
+    fn setup_pool(env: &Env) -> (Address, Address, Address, Address, LendingPoolContractClient<\'_>) {
     fn setup_pool(env: &Env) -> (Address, Address, Address, Address, LendingPoolContractClient<'_,>) {
+    fn setup_pool(env: &Env) -> (Address, Address, Address, LendingPoolContractClient<'_>) {
+        // 8% pool rate, 4% senior fixed rate
+        setup_pool_with_rates(env, 800u32, 400u32)
+    }
+
+    /// Like `setup_pool` but with explicit interest rates. A 0% rate keeps the
+    /// outstanding debt flat across ledger advances, which is convenient for
+    /// tests that need an overdue loan with a predictable loss amount.
+    fn setup_pool_with_rates(
+        env: &Env,
+        interest_rate_bps: u32,
+        senior_rate_bps: u32,
+    ) -> (Address, Address, Address, LendingPoolContractClient<'_>) {
         let admin = Address::generate(env);
         let investor = Address::generate(env);
         let treasury = Address::generate(env);
@@ -1312,13 +1927,36 @@ mod test {
 
         // Mint 100,000 USDC to investor.
         sac.mint(&investor, &100_000_0000000i128);
+        let escrow = Address::generate(env);
 
         let contract_id = env.register(LendingPoolContract, ());
         let client = LendingPoolContractClient::new(env, &contract_id);
+        client.initialize(&admin, &token_address, &escrow, &800u32); // 8% interest
+
+        (admin, investor, token_address, escrow, client)
         // 8% pool rate, 4% senior fixed rate
         client.initialize(&admin, &token_address, &800u32, &400u32, &treasury);
 
         (admin, investor, treasury, token_address, client)
+    }
+
+    /// Raise persistent-entry TTLs so that tests which fast-forward the ledger
+    /// to make a loan overdue (~90 days) do not archive contract storage.
+    /// `extend_ttl` never lowers an entry's lifetime, so the large initial TTL
+    /// set here survives the in-contract bumps. Call before any pool state is
+    /// written (i.e. before `initialize`).
+    fn extend_test_ttls(env: &Env) {
+        env.ledger().with_mut(|li| {
+            li.max_entry_ttl = 4_000_001;
+            li.min_persistent_entry_ttl = 4_000_000;
+        });
+    }
+
+    /// Advances the ledger past a loan's due date so it qualifies as overdue.
+    fn make_loan_overdue(env: &Env, client: &LendingPoolContractClient<'_>, loan_id: &BytesN<32>) {
+        let schedule = client.get_repayment_schedule(loan_id).unwrap();
+        env.ledger()
+            .set_sequence_number(schedule.next_due_ledger + DEFAULT_OVERDUE_LEDGERS + 1);
     }
 
     #[test]
@@ -1326,6 +1964,7 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
+        let (admin, _investor, token_address, _escrow, client) = setup_pool(&env);
         let (admin, _investor, treasury, token_address, client) = setup_pool(&env);
 
         let config = client.get_pool_config();
@@ -1347,6 +1986,7 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
+        let (_admin, investor, token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
 
@@ -1400,6 +2040,7 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
+        let (_admin, investor, _token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
 
         let result = client.try_deposit(&investor, &0i128, &Tranche::Senior);
@@ -1411,6 +2052,9 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
+        let (admin, _investor, token_address, _escrow, client) = setup_pool(&env);
+
+        let result = client.try_initialize(&admin, &token_address, &_escrow, &800u32);
         let (admin, _investor, _treasury, token_address, client) = setup_pool(&env);
 
         let result = client.try_initialize(&admin, &token_address, &800u32, &400u32, &Address::generate(&env));
@@ -1426,6 +2070,7 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
+        let (_admin, investor, _token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -1454,6 +2099,7 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
+        let (_admin, investor, _token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -1471,6 +2117,7 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
+        let (_admin, investor, _token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -1481,6 +2128,175 @@ mod test {
         // Same loan ID should fail.
         let result = client.try_request_loan(&borrower, &loan_id, &10_000_0000000i128);
         assert!(result.is_err());
+    }
+
+    // ── Verification Registry Gate ───────────────────────────────────────
+
+    /// Helper: deploy and initialize a VerificationRegistryContract.
+    fn setup_registry<'a>(
+        env: &'a Env,
+        admin: &Address,
+    ) -> verification_registry::VerificationRegistryContractClient<'a> {
+        let registry_id = env.register(verification_registry::VerificationRegistryContract, ());
+        let registry = verification_registry::VerificationRegistryContractClient::new(env, &registry_id);
+        registry.initialize(admin);
+        registry
+    }
+
+    #[test]
+    fn test_request_loan_succeeds_without_registry_configured() {
+        // Backward-compatible default: if no registry has ever been set,
+        // the gate is skipped entirely and loans behave as before.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, investor, token_address, _escrow, client) = setup_pool(&env);
+        let token = token::Client::new(&env, &token_address);
+        let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
+        let borrower = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+
+        client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
+
+        let result = client.try_request_loan(&borrower, &loan_id, &10_000_0000000i128);
+        assert!(result.is_ok());
+        assert_eq!(client.get_verification_registry(), None);
+    }
+
+    #[test]
+    fn test_admin_can_set_verification_registry() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
+        let registry = setup_registry(&env, &admin);
+
+        client.set_verification_registry(&registry.address);
+        assert_eq!(client.get_verification_registry(), Some(registry.address));
+    }
+
+    #[test]
+    fn test_non_admin_cannot_set_verification_registry() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
+        let registry_admin = Address::generate(&env);
+        let registry = setup_registry(&env, &registry_admin);
+        let non_admin = Address::generate(&env);
+
+        // Only the non-admin signs; the contract requires `config.admin`'s
+        // authorization, so the call must fail.
+        env.mock_auths(&[MockAuth {
+            address: &non_admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_verification_registry",
+                args: (registry.address.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = client.try_set_verification_registry(&registry.address);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_request_loan_rejects_unverified_borrower() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, investor, _token_address, _escrow, client) = setup_pool(&env);
+        let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
+        let registry = setup_registry(&env, &admin);
+        client.set_verification_registry(&registry.address);
+
+        let borrower = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+
+        client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
+
+        // Borrower has no record in the registry at all.
+        let result = client.try_request_loan(&borrower, &loan_id, &10_000_0000000i128);
+        assert_eq!(result.unwrap_err(), Ok(PoolError::ApplicantNotVerified));
+    }
+
+    #[test]
+    fn test_request_loan_succeeds_for_verified_borrower() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, investor, token_address, _escrow, client) = setup_pool(&env);
+        let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
+        let registry = setup_registry(&env, &admin);
+        client.set_verification_registry(&registry.address);
+
+        let borrower = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+        let report_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        registry.register_verification(&borrower, &report_hash, &1_000u32);
+
+        client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
+
+        let result = client.try_request_loan(&borrower, &loan_id, &10_000_0000000i128);
+        assert!(result.is_ok());
+
+        let loan = client.get_loan_info(&loan_id);
+        assert_eq!(loan.status, LoanStatus::Requested);
+    }
+
+    #[test]
+    fn test_request_loan_rejects_borrower_with_expired_verification() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
+        let registry = setup_registry(&env, &admin);
+        client.set_verification_registry(&registry.address);
+
+        let borrower = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+        let report_hash = BytesN::from_array(&env, &[4u8; 32]);
+
+        // Verification expires after 50 ledgers.
+        registry.register_verification(&borrower, &report_hash, &50u32);
+
+        // Advance the ledger well past expiration.
+        env.ledger().with_mut(|li| li.sequence_number += 1_000);
+
+        client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
+
+        let result = client.try_request_loan(&borrower, &loan_id, &10_000_0000000i128);
+        assert_eq!(result.unwrap_err(), Ok(PoolError::ApplicantNotVerified));
+    }
+
+    #[test]
+    fn test_request_loan_with_origin_also_gated() {
+        // The escrow bridge entry point shares the same gate, so a borrower
+        // cannot bypass verification by routing through the escrow path.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
+        let registry = setup_registry(&env, &admin);
+        client.set_verification_registry(&registry.address);
+
+        let borrower = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+        let escrow_origin = Address::generate(&env);
+
+        client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
+
+        let result = client.try_request_loan_with_origin(
+            &borrower,
+            &loan_id,
+            &10_000_0000000i128,
+            &escrow_origin,
+        );
+        assert_eq!(result.unwrap_err(), Ok(PoolError::ApplicantNotVerified));
     }
 
     #[test]
@@ -1513,6 +2329,9 @@ mod test {
         client.request_loan(&borrower, &loan_id, &70_000_0000000i128);
         client.approve_loan(&loan_id);
 
+        // Whitelist the contractor before disbursing.
+        client.add_contractor(&contractor);
+
         // Disburse 30,000 to contractor (first milestone).
         client.disburse(&loan_id, &contractor, &30_000_0000000i128);
         assert_eq!(token.balance(&contractor), 30_000_0000000i128);
@@ -1521,6 +2340,9 @@ mod test {
         client.disburse(&loan_id, &contractor, &40_000_0000000i128);
         let loan = client.get_loan_info(&loan_id);
         assert_eq!(loan.disbursed, 70_000_0000000i128);
+
+        // Advance ledger by 1 period to compound interest
+        env.ledger().set_sequence_number(env.ledger().sequence() + 100);
 
         // Borrower repays. Total owed = 70,000 + 8% = 75,600.
         let sac = StellarAssetClient::new(&env, &token_address);
@@ -1545,6 +2367,7 @@ mod test {
         client.deposit(&investor, &50_000_0000000i128, &Tranche::Senior);
         client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&contractor);
 
         // Try to disburse more than principal.
         let result = client.try_disburse(&loan_id, &contractor, &20_000_0000000i128);
@@ -1556,6 +2379,8 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
+        let (_admin, investor, token_address, _escrow, client) = setup_pool(&env);
+        let token = token::Client::new(&env, &token_address);
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -1579,6 +2404,7 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
+        let (_admin, investor, _token_address, _escrow, client) = setup_pool(&env);
         let (_admin, senior_investor, _treasury, token_address, client) = setup_pool(&env);
         let sac = StellarAssetClient::new(&env, &token_address);
 
@@ -1593,7 +2419,11 @@ mod test {
 
         client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&borrower);
         client.disburse(&loan_id, &borrower, &10_000_0000000i128);
+
+        // Advance ledger by 1 period to compound interest
+        env.ledger().set_sequence_number(env.ledger().sequence() + 100);
 
         sac.mint(&borrower, &20_000_0000000i128);
 
@@ -1618,6 +2448,10 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
+        let (_admin, investor1, token_address, _escrow, client) = setup_pool(&env);
+        
+        // Setup investor 2
+        let investor2 = Address::generate(&env);
         let (_admin, senior_investor, _treasury, token_address, client) = setup_pool(&env);
         let sac = StellarAssetClient::new(&env, &token_address);
 
@@ -1633,6 +2467,7 @@ mod test {
         // Loan 20,000; junior has 30,000 to absorb.
         client.request_loan(&borrower, &loan_id, &20_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&borrower);
         client.disburse(&loan_id, &borrower, &20_000_0000000i128);
 
         client.mark_default(&loan_id);
@@ -1657,7 +2492,11 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, senior_investor, _treasury, token_address, client) = setup_pool(&env);
+        // 0% interest keeps the loss exactly equal to the disbursed amount even
+        // after advancing the ledger to make the loan overdue.
+        extend_test_ttls(&env);
+        let (_admin, senior_investor, token_address, client) =
+            setup_pool_with_rates(&env, 0u32, 0u32);
         let sac = StellarAssetClient::new(&env, &token_address);
 
         let junior_investor = Address::generate(&env);
@@ -1672,8 +2511,10 @@ mod test {
         // Loan 20,000; junior has only 5,000 to absorb.
         client.request_loan(&borrower, &loan_id, &20_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&borrower);
         client.disburse(&loan_id, &borrower, &20_000_0000000i128);
 
+        make_loan_overdue(&env, &client, &loan_id);
         client.mark_default(&loan_id);
 
         let junior_info = client.get_tranche_info(&Tranche::Junior);
@@ -1718,6 +2559,7 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
+        let (_admin, investor, token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -1725,6 +2567,9 @@ mod test {
         client.deposit(&investor, &100_000_0000000i128, &Tranche::Senior);
         client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&borrower);
+        client.disburse(&loan_id, &borrower, &10_000_0000000i128);
+        env.ledger().set_sequence_number(env.ledger().sequence() + 100);
 
         let sac = StellarAssetClient::new(&env, &token_address);
         sac.mint(&borrower, &20_000_0000000i128);
@@ -1743,6 +2588,7 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
+        let (_admin, investor, token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -1750,6 +2596,9 @@ mod test {
         client.deposit(&investor, &100_000_0000000i128, &Tranche::Senior);
         client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&borrower);
+        client.disburse(&loan_id, &borrower, &10_000_0000000i128);
+        env.ledger().set_sequence_number(env.ledger().sequence() + 100);
 
         let sac = StellarAssetClient::new(&env, &token_address);
         sac.mint(&borrower, &20_000_0000000i128);
@@ -1765,11 +2614,86 @@ mod test {
         assert_eq!(record.claimed_yield, 800_0000000i128);
     }
 
+
+    #[contract]
+    pub struct MockEscrow;
+
+    #[contractimpl]
+    impl MockEscrow {
+        pub fn seize_collateral(env: Env, _borrower: Address, lending_pool_address: Address) -> i128 {
+            // Mock transferring 5000 USDC
+            let token_address = env.storage().instance().get(&symbol_short!("token")).unwrap();
+            let sac = StellarAssetClient::new(&env, &token_address);
+            // In a real scenario we'd use transfer, but in test we can just mint to the lending pool to simulate seized funds
+            sac.mint(&lending_pool_address, &5_000_0000000i128);
+            5_000_0000000i128
+        }
+        pub fn set_token(env: Env, token: Address) {
+            env.storage().instance().set(&symbol_short!("token"), &token);
+        }
+    }
+
+    #[test]
+    fn test_mark_default() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let investor = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_address = token_id.address();
+        let sac = StellarAssetClient::new(&env, &token_address);
+        sac.mint(&investor, &100_000_0000000i128);
+
+        let escrow_id = env.register(MockEscrow, ());
+        let mock_escrow = escrow_id.clone();
+        
+        // Setup mock escrow token
+        env.invoke_contract::<()>(&escrow_id, &symbol_short!("set_token"), soroban_sdk::vec![&env, token_address.into_val(&env)]);
+
+        let contract_id = env.register(LendingPoolContract, ());
+        let client = LendingPoolContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &token_address, &mock_escrow, &800u32);
+
+        client.deposit(&investor, &70_000_0000000i128);
+        client.request_loan(&borrower, &loan_id, &70_000_0000000i128);
+        client.approve_loan(&loan_id);
+
+        client.disburse(&loan_id, &borrower, &30_000_0000000i128);
+
+        // Advance schedule to have missed 3 payments
+        let mut sched: RepaymentSchedule = env.as_contract(&contract_id, || {
+            env.storage().persistent().get(&DataKey::LoanSchedule(loan_id.clone())).unwrap()
+        });
+        sched.payments_missed = 3;
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&DataKey::LoanSchedule(loan_id.clone()), &sched);
+        });
+
+        // Trigger default
+        client.mark_default(&loan_id);
+
+        let loan = client.get_loan_info(&loan_id);
+        assert_eq!(loan.status, LoanStatus::Defaulted);
+        assert_eq!(loan.repaid, 5_000_0000000i128); // 5000 seized from mock escrow
+
+        // Verify active commitments are reduced by undisbursed (70000 - 30000 = 40000)
+        // Original commitments: 70000. After disburse: 40000. After default: 0.
+        // Also liquidity increased by 5000 seized collateral.
+        let liquidity = client.get_liquidity();
+        assert_eq!(liquidity, 45_000_0000000i128); // 70000 - 30000 + 5000
+    }
+
     #[test]
     #[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
     fn test_unauthorized_withdrawal() {
         let env = Env::default();
 
+        let (_admin, _investor, _token_address, _escrow, client) = setup_pool(&env);
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
         let unauthorized = Address::generate(&env);
 
@@ -1811,7 +2735,7 @@ mod test {
 
         // Preview: 10_000 withdrawal at 0.1% = 10 fee, 9990 net
         let preview = client.preview_withdrawal_fee(&10_000_0000000i128);
-        assert_eq!(preview, (10_000_0000000i128, 1_0000000i128, 9_999_0000000i128, 10u32, 3_000u32));
+        assert_eq!(preview, (10_000_0000000i128, 10_0000000i128, 9_990_0000000i128, 10u32, 3_000u32));
     }
 
     #[test]
@@ -1932,10 +2856,14 @@ mod test {
         client.deposit(&investor, &100_000_0000000i128, &Tranche::Senior);
         client.request_loan(&borrower, &loan_id, &80_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&borrower);
         client.disburse(&loan_id, &borrower, &80_000_0000000i128);
 
         // High utilization during active loan
         assert_eq!(client.get_withdrawal_fee_bps(), 200u32);
+
+        // Advance ledger by 1 period to compound interest
+        env.ledger().set_sequence_number(env.ledger().sequence() + 100);
 
         // Borrower repays full amount
         sac.mint(&borrower, &90_000_0000000i128);
@@ -2117,6 +3045,7 @@ mod test {
         let loan_id = BytesN::from_array(&env, &[42u8; 32]);
         client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&borrower);
 
         // Disburse the full principal.
         client.disburse(&loan_id, &borrower, &10_000_0000000i128);
@@ -2254,6 +3183,7 @@ mod test {
         client.deposit(&investor, &50_000_0000000i128, &Tranche::Senior);
         client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
         client.approve_loan(&loan_id);
+        client.add_contractor(&borrower);
         client.disburse(&loan_id, &borrower, &10_000_0000000i128);
 
         let sac = StellarAssetClient::new(&env, &token_address);
@@ -2367,5 +3297,362 @@ mod test {
         env.mock_all_auths();
         let result = client.try_pause();
         assert!(result.is_ok());
+    }
+
+    // ── Default Handling ──────────────────────────────────────────────────
+
+    /// Fund the pool, approve and disburse a loan, then advance the ledger so
+    /// the loan is overdue. Returns (admin, token_address, loan_id). Uses 0%
+    /// interest so the loss equals the disbursed amount exactly.
+    fn setup_overdue_loan(env: &Env) -> (Address, Address, BytesN<32>, LendingPoolContractClient<'_>) {
+        extend_test_ttls(env);
+        let (admin, senior_investor, token_address, client) = setup_pool_with_rates(env, 0u32, 0u32);
+
+        // Junior 30,000 + Senior 70,000 = 100,000 liquidity.
+        let junior_investor = Address::generate(env);
+        let sac = StellarAssetClient::new(env, &token_address);
+        sac.mint(&junior_investor, &30_000_0000000i128);
+        client.deposit(&senior_investor, &70_000_0000000i128, &Tranche::Senior);
+        client.deposit(&junior_investor, &30_000_0000000i128, &Tranche::Junior);
+
+        let borrower = Address::generate(env);
+        let loan_id = mock_loan_id(env);
+        client.request_loan(&borrower, &loan_id, &20_000_0000000i128);
+        client.approve_loan(&loan_id);
+        client.disburse(&loan_id, &borrower, &20_000_0000000i128);
+
+        make_loan_overdue(env, &client, &loan_id);
+
+        (admin, token_address, loan_id, client)
+    }
+
+    #[test]
+    fn test_mark_default_records_loss_and_status() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, _token, loan_id, client) = setup_overdue_loan(&env);
+
+        client.mark_default(&loan_id);
+
+        let loan = client.get_loan_info(&loan_id);
+        assert_eq!(loan.status, LoanStatus::Defaulted);
+        assert!(loan.defaulted_ledger > 0);
+
+        // Loss = disbursed 20,000 (0% interest), absorbed by the junior tranche.
+        let health = client.get_pool_health();
+        assert_eq!(health.total_defaulted_loss, 20_000_0000000i128);
+        assert_eq!(health.defaulted_loans, 1);
+
+        let junior = client.get_tranche_info(&Tranche::Junior);
+        assert_eq!(junior.total_loss_absorbed, 20_000_0000000i128);
+        assert_eq!(junior.total_deposited, 10_000_0000000i128);
+    }
+
+    #[test]
+    fn test_mark_default_only_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, _token, loan_id, client) = setup_overdue_loan(&env);
+
+        // Drop all mocked authorizations: the admin requirement must now fail.
+        env.set_auths(&[]);
+        let result = client.try_mark_default(&loan_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mark_default_non_approved_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, investor, _token_address, client) = setup_pool(&env);
+        let borrower = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+
+        client.deposit(&investor, &50_000_0000000i128, &Tranche::Senior);
+        // Loan is Requested, never approved.
+        client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
+
+        let result = client.try_mark_default(&loan_id);
+        assert_eq!(result.unwrap_err(), Ok(PoolError::InvalidLoanState));
+    }
+
+    #[test]
+    fn test_mark_default_not_overdue_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, senior_investor, token_address, client) =
+            setup_pool_with_rates(&env, 0u32, 0u32);
+        let junior_investor = Address::generate(&env);
+        let sac = StellarAssetClient::new(&env, &token_address);
+        sac.mint(&junior_investor, &30_000_0000000i128);
+        client.deposit(&senior_investor, &70_000_0000000i128, &Tranche::Senior);
+        client.deposit(&junior_investor, &30_000_0000000i128, &Tranche::Junior);
+
+        let borrower = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+        client.request_loan(&borrower, &loan_id, &20_000_0000000i128);
+        client.approve_loan(&loan_id);
+        client.disburse(&loan_id, &borrower, &20_000_0000000i128);
+
+        // Loan is approved and current — not overdue.
+        let result = client.try_mark_default(&loan_id);
+        assert_eq!(result.unwrap_err(), Ok(PoolError::LoanNotOverdue));
+    }
+
+    #[test]
+    fn test_recover_default_reduces_loss() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, token_address, loan_id, client) = setup_overdue_loan(&env);
+        client.mark_default(&loan_id);
+
+        // Liquidity: 100,000 deposited - 20,000 disbursed - 20,000 loss = 60,000.
+        assert_eq!(client.get_liquidity(), 60_000_0000000i128);
+        assert_eq!(client.get_pool_health().total_defaulted_loss, 20_000_0000000i128);
+
+        // Admin recovers 8,000 (e.g. from liquidation) and returns it to the pool.
+        let sac = StellarAssetClient::new(&env, &token_address);
+        sac.mint(&admin, &8_000_0000000i128);
+        client.recover_default(&loan_id, &8_000_0000000i128);
+
+        // Loss drops by the recovered amount; liquidity rises by it.
+        assert_eq!(client.get_pool_health().total_defaulted_loss, 12_000_0000000i128);
+        assert_eq!(client.get_liquidity(), 68_000_0000000i128);
+
+        // Junior (the absorber) is partially restored.
+        let junior = client.get_tranche_info(&Tranche::Junior);
+        assert_eq!(junior.total_loss_absorbed, 12_000_0000000i128);
+        assert_eq!(junior.total_deposited, 18_000_0000000i128);
+    }
+
+    #[test]
+    fn test_recover_default_non_defaulted_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, _token, loan_id, client) = setup_overdue_loan(&env);
+        // Loan is overdue but not yet marked defaulted.
+        let result = client.try_recover_default(&loan_id, &1_000_0000000i128);
+        assert_eq!(result.unwrap_err(), Ok(PoolError::InvalidLoanState));
+    }
+
+    #[test]
+    fn test_get_pool_health_default_and_loss_ratio() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        extend_test_ttls(&env);
+        let (_admin, investor, _token_address, client) =
+            setup_pool_with_rates(&env, 0u32, 0u32);
+        client.deposit(&investor, &100_000_0000000i128, &Tranche::Senior);
+
+        let borrower = Address::generate(&env);
+        let loan1 = BytesN::from_array(&env, &[1u8; 32]);
+        let loan2 = BytesN::from_array(&env, &[2u8; 32]);
+
+        client.request_loan(&borrower, &loan1, &50_000_0000000i128);
+        client.request_loan(&borrower, &loan2, &30_000_0000000i128);
+        client.approve_loan(&loan1);
+        client.approve_loan(&loan2);
+        client.disburse(&loan1, &borrower, &50_000_0000000i128);
+
+        // Default loan1 only: 1 of 2 loans, 50,000 loss of 100,000 deposited.
+        make_loan_overdue(&env, &client, &loan1);
+        client.mark_default(&loan1);
+
+        let health = client.get_pool_health();
+        assert_eq!(health.total_loans, 2);
+        assert_eq!(health.defaulted_loans, 1);
+        assert_eq!(health.total_defaulted_loss, 50_000_0000000i128);
+        // 1/2 = 50% = 5000 bps.
+        assert_eq!(health.default_rate_bps, 5000);
+        // 50,000 / 100,000 = 50% = 5000 bps.
+        assert_eq!(health.loss_ratio_bps, 5000);
+    }
+
+    #[test]
+    fn test_daily_borrow_limit_enforced() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
+        let borrower = Address::generate(&env);
+        let contractor = Address::generate(&env);
+
+        // Deposit liquidity.
+        client.deposit(&investor, &100_000_0000000i128, &Tranche::Senior);
+
+        // Configure daily limit to 10k USDC
+        assert_eq!(client.get_daily_borrow_limit(), 0);
+        client.set_daily_borrow_limit(&10_000_0000000i128);
+        assert_eq!(client.get_daily_borrow_limit(), 10_000_0000000i128);
+
+        // Request and approve a 50k loan.
+        let loan_id = mock_loan_id(&env);
+        client.request_loan(&borrower, &loan_id, &50_000_0000000i128);
+        client.approve_loan(&loan_id);
+        client.add_contractor(&contractor);
+
+        // Disburse 10k -> should succeed.
+        client.disburse(&loan_id, &contractor, &10_000_0000000i128);
+        assert_eq!(client.get_daily_borrowed(), 10_000_0000000i128);
+
+        // Disburse another 1k -> should fail (exceeds daily limit).
+        let result = client.try_disburse(&loan_id, &contractor, &1_000_0000000i128);
+        assert_eq!(result.unwrap_err(), Ok(PoolError::DailyBorrowLimitExceeded));
+
+        // Advance ledger by 1 day (100 ledgers in test).
+        let current = env.ledger().sequence();
+        env.ledger().set_sequence_number(current + 100);
+
+        // Accumulator for the new day should be 0.
+        assert_eq!(client.get_daily_borrowed(), 0);
+
+        // Disburse 1k -> should succeed now.
+        client.disburse(&loan_id, &contractor, &1_000_0000000i128);
+        assert_eq!(client.get_daily_borrowed(), 1_000_0000000i128);
+
+        // Disburse 10k -> should fail.
+        let result2 = client.try_disburse(&loan_id, &contractor, &10_000_0000000i128);
+        assert_eq!(result2.unwrap_err(), Ok(PoolError::DailyBorrowLimitExceeded));
+    }
+
+    // ── Contractor Whitelist Tests ───────────────────────────────────────
+
+    #[test]
+    fn test_is_whitelisted_returns_correct_boolean() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
+        let contractor = Address::generate(&env);
+
+        // Not whitelisted by default.
+        assert!(!client.is_whitelisted(&contractor));
+
+        client.add_contractor(&contractor);
+        assert!(client.is_whitelisted(&contractor));
+
+        client.remove_contractor(&contractor);
+        assert!(!client.is_whitelisted(&contractor));
+    }
+
+    #[test]
+    fn test_disburse_to_whitelisted_contractor_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
+        let token = token::Client::new(&env, &token_address);
+        let borrower = Address::generate(&env);
+        let contractor = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+
+        client.deposit(&investor, &50_000_0000000i128, &Tranche::Senior);
+        client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
+        client.approve_loan(&loan_id);
+
+        client.add_contractor(&contractor);
+        client.disburse(&loan_id, &contractor, &10_000_0000000i128);
+
+        assert_eq!(token.balance(&contractor), 10_000_0000000i128);
+    }
+
+    #[test]
+    fn test_disburse_to_non_whitelisted_contractor_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
+        let borrower = Address::generate(&env);
+        let contractor = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+
+        client.deposit(&investor, &50_000_0000000i128, &Tranche::Senior);
+        client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
+        client.approve_loan(&loan_id);
+
+        // Recipient was never whitelisted.
+        let result = client.try_disburse(&loan_id, &contractor, &10_000_0000000i128);
+        assert_eq!(result.unwrap_err(), Ok(PoolError::UnauthorizedContractor));
+    }
+
+    #[test]
+    fn test_disburse_fails_after_contractor_removed() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
+        let borrower = Address::generate(&env);
+        let contractor = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+
+        client.deposit(&investor, &50_000_0000000i128, &Tranche::Senior);
+        client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
+        client.approve_loan(&loan_id);
+
+        client.add_contractor(&contractor);
+        client.remove_contractor(&contractor);
+
+        let result = client.try_disburse(&loan_id, &contractor, &5_000_0000000i128);
+        assert_eq!(result.unwrap_err(), Ok(PoolError::UnauthorizedContractor));
+    }
+
+    #[test]
+    fn test_only_admin_can_add_contractor() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
+        let non_admin = Address::generate(&env);
+        let contractor = Address::generate(&env);
+
+        // Only the non-admin signs; add_contractor requires the pool admin's
+        // authorization, so the call must fail.
+        env.mock_auths(&[MockAuth {
+            address: &non_admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "add_contractor",
+                args: (contractor.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = client.try_add_contractor(&contractor);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_only_admin_can_remove_contractor() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
+        let contractor = Address::generate(&env);
+        client.add_contractor(&contractor);
+
+        let non_admin = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &non_admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "remove_contractor",
+                args: (contractor.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = client.try_remove_contractor(&contractor);
+        assert!(result.is_err());
     }
 }

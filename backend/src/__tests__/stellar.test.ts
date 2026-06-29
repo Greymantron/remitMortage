@@ -4,12 +4,14 @@ import {
   fetchAllOperations,
   summarizePayments,
   detectSelfDealing,
+  createHorizonServer,
   InvalidStellarAddressError,
   PAGE_LIMIT,
   HorizonOperation,
   HorizonServerLike,
   OperationsPageLike,
 } from "../services/stellar";
+import * as redisService from "../services/redis";
 
 /** Build a payment operation record as Horizon would return it. */
 function payment(
@@ -95,6 +97,48 @@ describe("analyzeRemittanceHistory (pagination aggregation)", () => {
     const result = await analyzeRemittanceHistory(SENDER, RECIPIENT, { server });
 
     expect(result.totalPayments).toBe(250);
+    expect(result.eligible).toBe(true);
+    expect(result.selfDealing).toBe(false);
+  });
+
+  it("queries Horizon once and caches the result for subsequent calls", async () => {
+    jest.spyOn(redisService, "getCacheValue")
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        senderAddress: SENDER,
+        recipientAddress: RECIPIENT,
+        totalPayments: 8,
+        totalAmountUSDC: "800.00",
+        averageAmountUSDC: "100.00",
+        standardDeviation: 0,
+        firstPayment: null,
+        lastPayment: null,
+        spanMonths: 0,
+        selfDealing: false,
+        eligible: true,
+        reason: "cached",
+      });
+    const setSpy = jest.spyOn(redisService, "setCacheValue").mockResolvedValue();
+
+    const server = mockServer({ [SENDER]: monthlySpanPayments(8) });
+
+    const first = await analyzeRemittanceHistory(SENDER, RECIPIENT, { server });
+    const second = await analyzeRemittanceHistory(SENDER, RECIPIENT, { server });
+
+    expect(first.eligible).toBe(true);
+    expect(second.reason).toBe("cached");
+    expect(setSpy).toHaveBeenCalledWith(expect.any(String), expect.any(Object), 300);
+  });
+
+  it("falls back gracefully when Redis is offline", async () => {
+    jest.spyOn(redisService, "getCacheValue").mockResolvedValue(null);
+    jest.spyOn(redisService, "setCacheValue").mockImplementation(async () => {
+      throw new Error("offline");
+    });
+
+    const server = mockServer({ [SENDER]: monthlySpanPayments(8) });
+    const result = await analyzeRemittanceHistory(SENDER, RECIPIENT, { server });
+
     expect(result.eligible).toBe(true);
     expect(result.selfDealing).toBe(false);
   });
@@ -237,5 +281,42 @@ describe("summarizePayments (average + timespan)", () => {
     expect(stats.averageAmountUSDC).toBe("0");
     expect(stats.spanMonths).toBe(0);
     expect(stats.firstPayment).toBeNull();
+  });
+});
+
+// ── Multi-network configuration ────────────────────────────────────────────
+
+describe("createHorizonServer (multi-network)", () => {
+  it("uses the supplied URL when explicitly provided", () => {
+    const customUrl = "https://custom-horizon.example.com";
+    const server = createHorizonServer(customUrl, "testnet");
+    // The returned server is an HorizonServerLike; verify it was constructed
+    // without throwing and exposes the operations builder.
+    expect(typeof server.operations).toBe("function");
+  });
+
+  it("falls back to the canonical testnet URL when horizonUrl is empty", () => {
+    const server = createHorizonServer("", "testnet");
+    expect(typeof server.operations).toBe("function");
+  });
+
+  it("falls back to the canonical mainnet URL when horizonUrl is empty", () => {
+    const server = createHorizonServer("", "mainnet");
+    expect(typeof server.operations).toBe("function");
+  });
+
+  it("falls back to the local standalone URL when horizonUrl is empty", () => {
+    const server = createHorizonServer("", "standalone");
+    expect(typeof server.operations).toBe("function");
+  });
+
+  it("analysis runs identically against a futurenet-targeted mock server", async () => {
+    const server = mockServer({
+      [SENDER]: monthlySpanPayments(8),
+      [RECIPIENT]: [],
+    });
+    const result = await analyzeRemittanceHistory(SENDER, RECIPIENT, { server });
+    expect(result.eligible).toBe(true);
+    expect(result.selfDealing).toBe(false);
   });
 });

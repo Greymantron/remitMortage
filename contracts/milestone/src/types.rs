@@ -14,6 +14,8 @@ pub struct MilestoneConfig {
     pub approvers: Vec<Address>,
     /// Number of approver votes required to approve a milestone.
     pub threshold: u32,
+    /// Minimum number of ledgers that must elapse between approval and release.
+    pub min_delay_ledgers: u32,
 }
 
 /// Milestone status lifecycle.
@@ -24,6 +26,8 @@ pub enum MilestoneStatus {
     Proposed = 0,
     Approved = 1,
     Disbursed = 2,
+    Disputed = 3,
+    Refunded = 4,
 }
 
 /// Milestone record stored on-chain.
@@ -46,6 +50,10 @@ pub struct MilestoneRecord {
     pub votes: u32,
     /// Ledger sequence at which the milestone was proposed.
     pub created_ledger: u32,
+    /// Ledger sequence at which the milestone was approved and the timelock began.
+    pub approved_ledger: u32,
+    /// Ledger sequence at which the milestone was disputed (0 if not disputed).
+    pub disputed_ledger: u32,
 }
 
 /// Storage keys for the milestone contract.
@@ -60,4 +68,6 @@ pub enum DataKey {
     Voted(BytesN<32>, Address),
     /// Total number of milestones proposed.
     MilestoneCount,
+    /// Reentrancy guard flag — true while a mutating function is executing.
+    Reentrant,
 }
