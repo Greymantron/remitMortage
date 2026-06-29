@@ -1,15 +1,20 @@
 import { Router } from "express";
 import crypto from "crypto";
+import jwt from "jsonwebtoken";
 import { Keypair } from "@stellar/stellar-sdk";
+import logger from "../utils/logger.js";
 import { analyzeRemittanceHistory } from "../services/stellar.js";
 import { hashReportContent, streamVerificationPdf, VerificationReport } from "../services/pdf.js";
 import { calculateCreditScore } from "../services/scoring.js";
-import { validateVerificationBody, validateMultiChainOwnership } from "../middleware/validate.js";
-import { verificationChallengeRateLimiter } from "../middleware/rateLimit.js";
+import { validateVerificationBody, validateWalletAddress, validateMultiChainOwnership } from "../middleware/validate.js";
+import {
+  verificationChallengeRateLimiter,
+  verificationOwnershipRateLimiter,
+} from "../middleware/rateLimit.js";
 import { createChallenge, consumeChallenge } from "../services/challengeStore.js";
 import { verifyEvmSignature } from "../services/evm.js";
 import { verifySolanaSignature } from "../services/solana.js";
-import { prisma } from "../services/db.js";
+import { upsertApplicant, createVerificationResult } from "../services/db.js";
 
 export const verificationRouter = Router();
 
@@ -47,38 +52,34 @@ verificationRouter.post("/check", validateVerificationBody, async (req, res) => 
     const analysis = await analyzeRemittanceHistory(senderAddress, recipientAddress);
 
     const reportId = crypto.randomUUID();
-    const generatedAt = new Date();
+    const generatedAt = new Date().toISOString();
+    const reportHash = hashReportContent(reportId, generatedAt, analysis);
 
-    const reportHash = hashReportContent(reportId, generatedAt.toISOString(), analysis);
+    const report: VerificationReport = { reportId, generatedAt, analysis, reportHash };
+    reportStore.set(reportId, report);
 
-    const applicant = await prisma.applicant.upsert({
-      where: { stellarAddress: senderAddress },
-      update: {},
-      create: { stellarAddress: senderAddress },
-    });
-
-    await prisma.verificationResult.create({
-      data: {
-        id: reportId,
+    // Persist applicant and verification result — non-blocking on failure
+    try {
+      const { score } = calculateCreditScore(analysis);
+      const applicant = await upsertApplicant(senderAddress, {
+        verificationStatus: analysis.eligible ? "ELIGIBLE" : "INELIGIBLE",
+        creditScore: score,
+      });
+      await createVerificationResult({
         applicantId: applicant.id,
         reportHash,
-        generatedAt,
-        analysis,
-        firstPayment: analysis.firstPayment ? new Date(analysis.firstPayment) : null,
-        lastPayment: analysis.lastPayment ? new Date(analysis.lastPayment) : null,
         totalPayments: analysis.totalPayments,
+        totalVolume: Number(analysis.totalAmountUSDC),
+        spanMonths: analysis.spanMonths,
         eligible: analysis.eligible,
-      },
-    });
+      });
+    } catch (dbErr) {
+      console.error("DB persist error (non-fatal):", dbErr);
+    }
 
-    res.json({
-      ...analysis,
-      reportId,
-      generatedAt: generatedAt.toISOString(),
-      reportHash,
-    });
+    res.json({ ...analysis, reportId, generatedAt, reportHash });
   } catch (error) {
-    console.error("Verification error:", error);
+    logger.error("Verification error", { error });
     res.status(500).json({ error: "Verification service failed" });
   }
 });
@@ -155,7 +156,7 @@ verificationRouter.get("/report/:reportId", async (req, res) => {
 
     streamVerificationPdf(report, res);
   } catch (error) {
-    console.error("PDF generation error:", error);
+    logger.error("PDF generation error", { error });
     res.status(500).json({ error: "PDF generation failed" });
   }
 });
@@ -190,7 +191,7 @@ verificationRouter.post("/score", validateVerificationBody, async (req, res) => 
     const scoreResult = calculateCreditScore(analysisResult);
     res.json(scoreResult);
   } catch (error) {
-    console.error("Scoring error:", error);
+    logger.error("Scoring error", { error });
     res.status(500).json({ error: "Scoring service failed" });
   }
 });
@@ -260,7 +261,7 @@ verificationRouter.post("/challenge", verificationChallengeRateLimiter, validate
  *       410:
  *         description: Challenge expired or already used.
  */
-verificationRouter.post("/verify-ownership", verificationChallengeRateLimiter, validateMultiChainOwnership, (req, res) => {
+verificationRouter.post("/verify-ownership", verificationOwnershipRateLimiter, validateMultiChainOwnership, (req, res) => {
   const { walletAddress, network, challenge, signature } = req.body;
 
   if (!challenge || !signature) {
@@ -294,6 +295,19 @@ verificationRouter.post("/verify-ownership", verificationChallengeRateLimiter, v
     res.status(401).json({ error: "invalid_signature" });
     return;
   }
+
+  const token = jwt.sign(
+    { walletAddress, network },
+    process.env.JWT_SECRET || "default_jwt_secret",
+    { expiresIn: "24h" }
+  );
+
+  res.cookie("token", token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "strict",
+    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+  });
 
   res.json({ verified: true, walletAddress, network });
 });

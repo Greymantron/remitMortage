@@ -1,6 +1,5 @@
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 generator client {
@@ -45,46 +44,70 @@ model UnpinnedCid {
   createdAt    DateTime @default(now())
 }
 
-model Applicant {
-  id                  String               @id @default(uuid())
-  stellarAddress      String               @unique
-  verifiedWallets Json?
-  creditScore         Int?
-  currentTier         String?
-  createdAt           DateTime             @default(now())
-  updatedAt           DateTime             @updatedAt
+enum VerificationStatus {
+  PENDING
+  ELIGIBLE
+  INELIGIBLE
+}
 
+enum LoanStatus {
+  PENDING
+  APPROVED
+  ACTIVE
+  REPAID
+  DEFAULTED
+}
+
+model Applicant {
+  id                 String             @id @default(uuid())
+  stellarAddress     String             @unique
+  verificationStatus VerificationStatus @default(PENDING)
+  creditScore        Int?
+  taxId              String?
+  monthlyIncome      String?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
   verificationResults VerificationResult[]
   loanApplications    LoanApplication[]
 }
 
 model VerificationResult {
-  id             String      @id @default(uuid())
+  id             String    @id @default(uuid())
   applicantId    String
-  applicant      Applicant   @relation(fields: [applicantId], references: [id], onDelete: Cascade)
-
+  applicant      Applicant @relation(fields: [applicantId], references: [id])
   reportHash     String
-  generatedAt    DateTime
-  analysis       Json
-  firstPayment   DateTime?
-  lastPayment    DateTime?
   totalPayments  Int
+  totalVolume    Float
+  spanMonths     Float
   eligible       Boolean
-
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  analyzedAt     DateTime  @default(now())
 }
 
 model LoanApplication {
-  id                String      @id @default(uuid())
-  applicantId       String
-  applicant         Applicant   @relation(fields: [applicantId], references: [id], onDelete: Cascade)
+  id                 String     @id @default(uuid())
+  applicantId        String
+  applicant          Applicant  @relation(fields: [applicantId], references: [id])
+  escrowContractId   String?
+  loanId             String?
+  principal          Float
+  status             LoanStatus @default(PENDING)
+  createdAt          DateTime   @default(now())
 
-  principal         String
-  status            LoanStatus  @default(Pending)
-  escrowContractId  String?
-  terms             String?
+  // New fields for repayment tracking
+  dueDate            DateTime?
+  missedPayments     Int        @default(0)
+  lateFeeBalance     Float      @default(0)
+  gracePeriodEndsAt  DateTime?
+}
 
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+model AuditLog {
+  id           String   @id @default(uuid())
+  action       String
+  actorAddress String?
+  ipAddress    String?
+  metadata     Json?
+  createdAt    DateTime @default(now())
+
+  @@index([action])
+  @@index([actorAddress])
 }

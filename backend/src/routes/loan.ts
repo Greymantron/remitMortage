@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { StrKey } from "@stellar/stellar-sdk";
+import logger from "../utils/logger.js";
 import { validatePositiveNumber } from "../middleware/validate.js";
 import {
   createApplication,
@@ -36,7 +37,7 @@ loanRouter.post("/apply", validatePositiveNumber("amount"), async (req, res) => 
     const app = await createApplication(borrowerAddress, String(amount));
     return res.status(201).json(app);
   } catch (error) {
-    console.error("Loan apply error:", error);
+    logger.error("Loan apply error", { error });
     return res.status(500).json({ error: "failed_to_create_application" });
   }
 });
@@ -72,8 +73,10 @@ loanRouter.post("/:id/approve", async (req, res) => {
   try {
     const approved = await updateApplication(id, { status: "Approved" });
 
-    console.log(`Simulating on-chain request_loan for application ${id}`);
-    const disbursing = await updateApplication(id, { status: "Disbursing" });
+    // simulate request_loan + approve_loan
+    logger.info(`Simulating on-chain request_loan for application ${id}`);
+    // After simulation, proceed to Disbursing
+    const disbursing = updateApplication(id, { status: "Disbursing" });
 
     const email = req.body.email || `${app.borrowerAddress}@example.com`;
     const webhookUrl = req.body.webhookUrl || "https://partner-platform.com/webhooks";
@@ -104,7 +107,7 @@ loanRouter.post("/:id/approve", async (req, res) => {
 
     return res.json(disbursing);
   } catch (err) {
-    console.error("Approve error:", err);
+    logger.error("Approve error", { err });
     return res.status(500).json({ error: "approve_failed" });
   }
 });
@@ -176,7 +179,7 @@ loanRouter.post("/:id/trigger-payment-due", async (req, res) => {
       webhookNotificationId: webhookNotif.id
     });
   } catch (error: any) {
-    console.error("Trigger payment due error:", error);
+    logger.error("Trigger payment due error", { error });
     return res.status(500).json({ error: "failed_to_trigger_notifications", message: error.message });
   }
 });

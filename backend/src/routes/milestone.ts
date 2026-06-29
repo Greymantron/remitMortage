@@ -1,5 +1,6 @@
 import { Router } from "express";
 import multer from "multer";
+import logger from "../utils/logger.js";
 import { pinFileToIPFS, unpinFileFromIPFS } from "../services/ipfs.js";
 import { logUnpinnedCid } from "../services/ipfsAudit.js";
 import { unpinEvidenceCid } from "../services/ipfsCleanup.js";
@@ -8,6 +9,7 @@ import {
   getProposal,
   updateProposal,
 } from "../services/milestoneProposalStore.js";
+import { verifyUploadAuthorization } from "../services/contractorAuth.js";
 
 export const milestoneRouter = Router();
 
@@ -26,9 +28,29 @@ const uploadSingle = upload.single("file");
  * /api/milestone/upload:
  *   post:
  *     summary: Upload and pin milestone progress evidence to IPFS
- *     description: Accepts multipart/form-data with a single file (max 10MB), validates type (JPEG, PNG, WEBP, MP4), and pins it to IPFS via Pinata.
+ *     description: >
+ *       Accepts multipart/form-data with a single file (max 10MB), validates type
+ *       (JPEG, PNG, WEBP, MP4), and pins it to IPFS via Pinata. The caller must
+ *       prove they are a whitelisted contractor/admin by supplying a Stellar
+ *       address, a single-use challenge (previously issued to that address) and a
+ *       hex-encoded signature of the challenge, via either the
+ *       `x-wallet-address` / `x-challenge` / `x-signature` headers or matching
+ *       multipart body fields.
  *     tags:
  *       - Milestone
+ *     parameters:
+ *       - in: header
+ *         name: x-wallet-address
+ *         schema: { type: string }
+ *         description: Whitelisted contractor/admin Stellar public key.
+ *       - in: header
+ *         name: x-challenge
+ *         schema: { type: string }
+ *         description: Single-use challenge issued to the address.
+ *       - in: header
+ *         name: x-signature
+ *         schema: { type: string }
+ *         description: Hex-encoded signature of the challenge.
  *     requestBody:
  *       required: true
  *       content:
@@ -39,6 +61,12 @@ const uploadSingle = upload.single("file");
  *               file:
  *                 type: string
  *                 format: binary
+ *               address:
+ *                 type: string
+ *               challenge:
+ *                 type: string
+ *               signature:
+ *                 type: string
  *     responses:
  *       201:
  *         description: File pinned successfully.
@@ -54,7 +82,9 @@ const uploadSingle = upload.single("file");
  *                 size:
  *                   type: number
  *       400:
- *         description: Missing or invalid file type.
+ *         description: Missing or invalid file type, or missing auth fields.
+ *       401:
+ *         description: Unauthorized — signature missing, invalid, or address not whitelisted.
  *       413:
  *         description: File size exceeds 10MB.
  *       500:
@@ -77,6 +107,17 @@ milestoneRouter.post("/upload", (req, res, next) => {
   });
 }, async (req, res) => {
   try {
+    // Authorize the caller before doing any work: only a whitelisted
+    // contractor/admin who can sign a fresh challenge may pin to IPFS.
+    const auth = verifyUploadAuthorization({
+      address: (req.headers["x-wallet-address"] as string) ?? req.body?.address,
+      challenge: (req.headers["x-challenge"] as string) ?? req.body?.challenge,
+      signature: (req.headers["x-signature"] as string) ?? req.body?.signature,
+    });
+    if (!auth.ok) {
+      return res.status(auth.status).json({ error: auth.error, message: auth.message });
+    }
+
     const file = req.file;
 
     if (!file) {
@@ -111,7 +152,7 @@ milestoneRouter.post("/upload", (req, res, next) => {
       size: file.size,
     });
   } catch (error: any) {
-    console.error("[MilestoneUpload] Error in upload route:", error);
+    logger.error("[MilestoneUpload] Error in upload route", { error });
     return res.status(500).json({
       error: "ipfs_pinning_failed",
       message: error.message || "Failed to upload and pin file to IPFS.",
@@ -155,13 +196,13 @@ milestoneRouter.delete("/unpin/:cid", async (req, res) => {
     });
     return res.json({ cid: result.cid, status: result.status });
   } catch (error: any) {
-    console.warn("[MilestoneUnpin] Error unpinning CID:", error.message);
+    logger.warn("[MilestoneUnpin] Error unpinning CID", { message: error.message });
     await logUnpinnedCid({
       cid,
       success: false,
       error: error.message,
     }).catch((auditError) => {
-      console.warn("[MilestoneUnpin] Failed to write audit log:", auditError);
+      logger.warn("[MilestoneUnpin] Failed to write audit log", { auditError });
     });
     return res.status(500).json({
       error: "ipfs_unpin_failed",
@@ -223,7 +264,7 @@ milestoneRouter.post("/proposals/:id/reject", async (req, res) => {
 
   if (proposal.evidenceCid) {
     unpinEvidenceCid(proposal.evidenceCid, id).catch((err) => {
-      console.warn(`[MilestoneReject] Background unpin failed for proposal ${id}:`, err);
+      logger.warn(`[MilestoneReject] Background unpin failed for proposal ${id}`, { err });
     });
   }
 
