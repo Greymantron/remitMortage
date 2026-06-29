@@ -11,7 +11,7 @@ use crate::errors::EscrowError;
 use crate::token_utils::get_token_client;
 use crate::types::{BorrowerRecord, DataKey, EscrowConfig, PendingUpgradeRecord};
 use lending_pool::LendingPoolContractClient;
-use soroban_sdk::{contract, contractimpl, symbol_short, xdr::ToXdr, Address, BytesN, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, symbol_short, xdr::ToXdr, Address, BytesN, Env, Symbol, IntoVal, Val};
 
 const INSTANCE_BUMP_AMOUNT: u32 = 518_400; // ~30 days
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 129_600; // ~7.5 days
@@ -55,6 +55,7 @@ impl EscrowContract {
                 withdrawn: false,
                 last_contribution_ledger: 0,
                 target_amount,
+                yield_shares: 0,
             })
     }
 
@@ -85,6 +86,14 @@ impl EscrowContract {
         env.storage()
             .instance()
             .get(&DataKey::TotalPooled)
+            .unwrap_or(0i128)
+    }
+
+    /// Read the total yield shares.
+    fn read_total_yield_shares(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalYieldShares)
             .unwrap_or(0i128)
     }
 
@@ -131,6 +140,7 @@ impl EscrowContract {
 
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::TotalPooled, &0i128);
+        env.storage().instance().set(&DataKey::TotalYieldShares, &0i128);
         env.storage().instance().set(&DataKey::Version, &1u32);
         env.storage()
             .instance()
@@ -166,6 +176,16 @@ impl EscrowContract {
         // Transfer USDC from borrower to this contract.
         let token = get_token_client(&env, &config.token);
         token.transfer(&borrower, &env.current_contract_address(), &amount);
+
+        // Route to yield vault if configured.
+        if let Some(vault) = &config.yield_vault {
+            let invoke_args = soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), amount.into_val(&env)];
+            let shares: i128 = env.invoke_contract(vault, &Symbol::new(&env, "deposit"), invoke_args);
+            
+            record.yield_shares += shares;
+            let total_shares = Self::read_total_yield_shares(&env) + shares;
+            env.storage().instance().set(&DataKey::TotalYieldShares, &total_shares);
+        }
 
         let current_ledger = env.ledger().sequence();
 
@@ -236,9 +256,24 @@ impl EscrowContract {
             config.penalty_bps_tier4
         };
 
+        // Handle yield routing withdrawal
+        let mut amount_withdrawn = record.deposited;
+        if let Some(vault) = &config.yield_vault {
+            if record.yield_shares > 0 {
+                let invoke_args = soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), record.yield_shares.into_val(&env)];
+                amount_withdrawn = env.invoke_contract(vault, &Symbol::new(&env, "withdraw"), invoke_args);
+                
+                let total_shares = Self::read_total_yield_shares(&env) - record.yield_shares;
+                env.storage().instance().set(&DataKey::TotalYieldShares, &total_shares);
+                record.yield_shares = 0;
+            }
+        }
+        
+        let accrued_yield = amount_withdrawn.saturating_sub(record.deposited).max(0);
+
         // Calculate penalty and refund.
         let penalty = (record.deposited * penalty_bps as i128) / 10_000;
-        let refund = record.deposited - penalty;
+        let refund = (record.deposited - penalty) + accrued_yield;
 
         // Transfer refund back to borrower.
         let token = get_token_client(&env, &config.token);
@@ -307,14 +342,24 @@ impl EscrowContract {
             }
         }
 
-        let amount = record.deposited;
+        let mut amount_withdrawn = record.deposited;
+        if let Some(vault) = &config.yield_vault {
+            if record.yield_shares > 0 {
+                let invoke_args = soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), record.yield_shares.into_val(&env)];
+                amount_withdrawn = env.invoke_contract(vault, &Symbol::new(&env, "withdraw"), invoke_args);
+                
+                let total_shares = Self::read_total_yield_shares(&env) - record.yield_shares;
+                env.storage().instance().set(&DataKey::TotalYieldShares, &total_shares);
+                record.yield_shares = 0;
+            }
+        }
 
         // Transfer to recipient (e.g., lending pool or construction fund).
         let token = get_token_client(&env, &config.token);
-        token.transfer(&env.current_contract_address(), &recipient, &amount);
+        token.transfer(&env.current_contract_address(), &recipient, &amount_withdrawn);
 
         // Update total pooled.
-        let total = Self::read_total_pooled(&env) - amount;
+        let total = Self::read_total_pooled(&env) - record.deposited;
         env.storage().instance().set(&DataKey::TotalPooled, &total);
 
         // Mark as released.
@@ -328,10 +373,10 @@ impl EscrowContract {
 
         env.events().publish(
             (symbol_short!("release"), goal_id.clone()),
-            (borrower.clone(), amount),
+            (borrower.clone(), amount_withdrawn),
         );
 
-        Ok(amount)
+        Ok(amount_withdrawn)
     }
 
     /// Release the borrower's savings and automatically request a 70% loan
@@ -383,9 +428,22 @@ impl EscrowContract {
 
         let amount = record.deposited;
 
+        // Handle yield routing withdrawal
+        let mut amount_withdrawn = amount;
+        if let Some(vault) = &config.yield_vault {
+            if record.yield_shares > 0 {
+                let invoke_args = soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), record.yield_shares.into_val(&env)];
+                amount_withdrawn = env.invoke_contract(vault, &Symbol::new(&env, "withdraw"), invoke_args);
+                
+                let total_shares = Self::read_total_yield_shares(&env) - record.yield_shares;
+                env.storage().instance().set(&DataKey::TotalYieldShares, &total_shares);
+                record.yield_shares = 0;
+            }
+        }
+
         // Transfer escrow savings to the recipient.
         let token = get_token_client(&env, &config.token);
-        token.transfer(&env.current_contract_address(), &recipient, &amount);
+        token.transfer(&env.current_contract_address(), &recipient, &amount_withdrawn);
 
         // Generate a deterministic loan ID from the borrower and goal.
         let loan_id = Self::generate_loan_id(&env, &borrower, &goal_id);
@@ -415,10 +473,10 @@ impl EscrowContract {
 
         env.events().publish(
             (symbol_short!("release"), goal_id.clone()),
-            (borrower.clone(), amount),
+            (borrower.clone(), amount_withdrawn),
         );
 
-        Ok(amount)
+        Ok(amount_withdrawn)
     }
 
     fn generate_loan_id(env: &Env, borrower: &Address, goal_id: &Symbol) -> BytesN<32> {
@@ -469,7 +527,22 @@ impl EscrowContract {
         }
 
         let penalty = (record.deposited * config.default_penalty_bps as i128) / 10_000;
-        let refund = record.deposited - penalty;
+
+        // Handle yield routing withdrawal
+        let mut amount_withdrawn = record.deposited;
+        if let Some(vault) = &config.yield_vault {
+            if record.yield_shares > 0 {
+                let invoke_args = soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), record.yield_shares.into_val(&env)];
+                amount_withdrawn = env.invoke_contract(vault, &Symbol::new(&env, "withdraw"), invoke_args);
+                
+                let total_shares = Self::read_total_yield_shares(&env) - record.yield_shares;
+                env.storage().instance().set(&DataKey::TotalYieldShares, &total_shares);
+                record.yield_shares = 0;
+            }
+        }
+        
+        let accrued_yield = amount_withdrawn.saturating_sub(record.deposited).max(0);
+        let refund = (record.deposited - penalty) + accrued_yield;
 
         let token = get_token_client(&env, &config.token);
         token.transfer(&env.current_contract_address(), &borrower, &refund);
@@ -839,6 +912,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 10u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         let goal_id = Symbol::new(env, "land");
@@ -869,6 +943,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 120_960u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         // Verify config was stored by reading from the contract's context.
@@ -918,6 +993,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 120_960u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         };
         client.initialize(&test_config);
         let result = client.try_initialize(&test_config);
@@ -953,6 +1029,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 120_960u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         let token = soroban_sdk::token::Client::new(&env, &token_address);
@@ -1573,6 +1650,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 10u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         let recipient = Address::generate(&env);
@@ -1622,6 +1700,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 10u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         let recipient = Address::generate(&env);
@@ -1675,6 +1754,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 10u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         client.deposit(&borrower, &goal_id, &10_000_0000000i128);
@@ -1719,6 +1799,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 10u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         client.deposit(&borrower, &goal_id, &5_000_0000000i128);
@@ -1949,6 +2030,7 @@ mod test {
             penalty_bps_tier4: 50u32,
             grace_period_ledgers: 10u32,
             default_penalty_bps: 1000u32,
+            yield_vault: None,
         });
 
         // Register and initialize lending pool.
@@ -2028,5 +2110,56 @@ mod test {
         // Second call should fail (deposited is 0 after first call).
         let result = escrow.try_release_and_request_loan(&borrower, &goal, &pool.address, &recipient);
         assert!(result.is_err());
+    }
+    #[test]
+    fn test_yield_routing() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_address = token_id.address();
+        let sac_client = StellarAssetClient::new(&env, &token_address);
+        sac_client.mint(&borrower, &50_000_0000000i128);
+
+        let vault_id = env.register(crate::test_utils::MockYieldVault, ());
+        
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        client.initialize(&EscrowConfig {
+            admin: admin.clone(),
+            token: token_address.clone(),
+            savings_target: 10_000_0000000i128,
+            max_duration_ledgers: 518_400u32,
+            early_withdrawal_penalty_bps: 500u32,
+            min_duration_ledgers: 0u32,
+            penalty_bps_tier1: 500u32,
+            penalty_bps_tier2: 300u32,
+            penalty_bps_tier3: 150u32,
+            penalty_bps_tier4: 50u32,
+            grace_period_ledgers: 10u32,
+            default_penalty_bps: 1000u32,
+            yield_vault: Some(vault_id.clone()),
+        });
+
+        let goal_id = Symbol::new(&env, "land");
+        
+        client.deposit(&borrower, &goal_id, &1000_0000000i128);
+        
+        let info = client.get_borrower_info(&borrower, &goal_id);
+        assert_eq!(info.deposited, 1000_0000000i128);
+        assert_eq!(info.yield_shares, 1000_0000000i128);
+
+        let pre_balance = sac_client.balance(&borrower);
+        let refund = client.withdraw(&borrower, &goal_id);
+        
+        assert_eq!(refund, 1050_0000000i128);
+        
+        let post_balance = sac_client.balance(&borrower);
+        assert_eq!(post_balance - pre_balance, 1050_0000000i128);
     }
 }

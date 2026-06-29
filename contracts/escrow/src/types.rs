@@ -30,6 +30,8 @@ pub struct EscrowConfig {
     pub grace_period_ledgers: u32,
     /// Penalty applied on forced default removal, in basis points.
     pub default_penalty_bps: u32,
+    /// Optional lending protocol vault address for yield routing.
+    pub yield_vault: Option<Address>,
 }
 
 /// Tracks an individual borrower's escrow balance and status per goal.
@@ -48,6 +50,8 @@ pub struct BorrowerRecord {
     pub last_contribution_ledger: u32,
     /// Savings target amount specific to this goal.
     pub target_amount: i128,
+    /// Shares held in the yield pool for accrued yield tracking.
+    pub yield_shares: i128,
 }
 
 /// Pending upgrade proposal (used when upgrade_delay_ledgers > 0).
@@ -80,4 +84,6 @@ pub enum DataKey {
     Paused,
     /// Pending new admin address for two-step admin transfer.
     PendingAdmin,
+    /// Total yield shares issued across all borrowers.
+    TotalYieldShares,
 }
