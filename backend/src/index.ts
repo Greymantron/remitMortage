@@ -21,10 +21,13 @@ import { startNotificationScheduler } from "./services/notification.js";
 import { startScheduler } from "./jobs/scheduler.js";
 import { loadConfig } from "./config.js";
 import logger from "./utils/logger.js";
+import { initializeRedis } from "./services/redis.js";
 
 const app = express();
 const config = loadConfig();
 const PORT = config.port;
+
+void initializeRedis();
 
 // ── Middleware ───────────────────────────────────────────────────────────
 app.use(requestLogger);

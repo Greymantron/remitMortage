@@ -28,6 +28,8 @@ export interface Config {
   webhookSecret: string;
   allowedOrigins: string[];
   adminApiKey: string;
+  redisUrl: string | null;
+  remittanceCacheTtl: number;
 }
 
 export function loadConfig(): Config {
@@ -58,5 +60,7 @@ export function loadConfig(): Config {
       ? process.env.ALLOWED_ORIGINS.split(",").map((origin) => origin.trim())
       : ["http://localhost:3000", "http://localhost:4000"],
     adminApiKey: process.env.ADMIN_API_KEY || "default_admin_api_key",
+    redisUrl: process.env.REDIS_URL || null,
+    remittanceCacheTtl: parseInt(process.env.REMITTANCE_CACHE_TTL || "300", 10),
   };
 }

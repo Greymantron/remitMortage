@@ -55,7 +55,9 @@ const reportStore = new Map<string, VerificationReport>();
 verificationRouter.post("/check", validateVerificationBody, async (req, res) => {
   try {
     const { senderAddress, recipientAddress } = req.body;
-    const analysis = await analyzeRemittanceHistory(senderAddress, recipientAddress);
+    const analysis = await analyzeRemittanceHistory(senderAddress, recipientAddress, {
+      invalidateCache: true,
+    });
 
     const reportId = crypto.randomUUID();
     const generatedAt = new Date().toISOString();
