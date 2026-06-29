@@ -4,7 +4,13 @@ import React, { useEffect, useState } from "react";
 import { toast } from "react-hot-toast";
 import { X, Loader2, AlertTriangle, ArrowRight, CheckCircle2 } from "lucide-react";
 import { useWallet } from "../context/WalletContext";
+import { useTransactionMonitor } from "../hooks/useTransactionMonitor";
 import { buildWithdrawTx, signAndSubmit, queryEscrowConfig } from "../lib/soroban";
+import {
+  formatTransactionErrorMessage,
+  type TransactionModalPhase,
+} from "../lib/transaction-status";
+import TransactionModal from "./tx/TransactionModal";
 
 type Props = {
   isOpen: boolean;
@@ -18,21 +24,32 @@ export default function WithdrawModal({ isOpen, onClose, deposited }: Props) {
   const [loadingConfig, setLoadingConfig] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [txPhase, setTxPhase] = useState<TransactionModalPhase>("idle");
+  const [txHash, setTxHash] = useState<string | null>(null);
+  const [txError, setTxError] = useState<string | null>(null);
+  const txMonitor = useTransactionMonitor(txHash ?? undefined);
 
   const depositNum = parseFloat(deposited) || 0;
   const penaltyPct = penaltyBps !== null ? penaltyBps / 100 : null;
   const penaltyAmount = penaltyPct !== null && penaltyPct !== null ? (depositNum * penaltyPct) / 100 : null;
   const refundAmount = penaltyAmount !== null ? depositNum - penaltyAmount : null;
 
+  function resetTransactionState() {
+    setTxPhase("idle");
+    setTxHash(null);
+    setTxError(null);
+  }
+
   useEffect(() => {
     if (!isOpen || !publicKey) return;
+    const accountId = publicKey;
     setConfirmed(false);
     setSubmitting(false);
 
     async function load() {
       setLoadingConfig(true);
       try {
-        const config = await queryEscrowConfig(publicKey);
+        const config = await queryEscrowConfig(accountId);
         setPenaltyBps(config.earlyWithdrawalPenaltyBps);
       } catch (e: any) {
         toast.error(e?.message || "Failed to fetch contract config");
@@ -44,23 +61,59 @@ export default function WithdrawModal({ isOpen, onClose, deposited }: Props) {
     load();
   }, [isOpen, publicKey]);
 
+  useEffect(() => {
+    if (txPhase !== "pending" || !txHash) return;
+
+    if (txMonitor.phase === "confirmed") {
+      setTxPhase("success");
+      return;
+    }
+
+    if (txMonitor.phase === "failed") {
+      setTxError(txMonitor.contractError || "The transaction reverted on-chain.");
+      setTxPhase("error");
+      return;
+    }
+
+    if (txMonitor.pollError) {
+      setTxError(txMonitor.pollError);
+      setTxPhase("error");
+    }
+  }, [
+    txHash,
+    txMonitor.contractError,
+    txMonitor.phase,
+    txMonitor.pollError,
+    txPhase,
+  ]);
+
   if (!isOpen) return null;
+
+  function handleTransactionModalClose() {
+    const wasSuccessful = txPhase === "success";
+    resetTransactionState();
+
+    if (wasSuccessful) {
+      setConfirmed(false);
+      onClose();
+    }
+  }
 
   async function handleWithdraw() {
     if (!publicKey || !confirmed) return;
     setSubmitting(true);
-    const toastId = toast.loading("Preparing withdrawal...");
+    setTxError(null);
+    setTxHash(null);
+    setTxPhase("simulating");
     try {
       const txXdr = await buildWithdrawTx(publicKey);
-      toast.loading("Waiting for Freighter signature...", { id: toastId });
+      setTxPhase("signing");
       const hash = await signAndSubmit(txXdr);
-      toast.dismiss();
-      toast.success("Withdrawal submitted successfully!");
-      setConfirmed(false);
-      onClose();
-    } catch (e: any) {
-      toast.dismiss();
-      toast.error(e?.message || "Withdrawal failed");
+      setTxHash(hash);
+      setTxPhase("pending");
+    } catch (error) {
+      setTxError(formatTransactionErrorMessage(error));
+      setTxPhase("error");
     } finally {
       setSubmitting(false);
     }
@@ -147,6 +200,15 @@ export default function WithdrawModal({ isOpen, onClose, deposited }: Props) {
           )}
         </div>
       </div>
+
+      <TransactionModal
+        isOpen={txPhase !== "idle"}
+        phase={txPhase}
+        transactionType="Withdrawal"
+        hash={txHash}
+        errorMessage={txError}
+        onClose={handleTransactionModalClose}
+      />
     </div>
   );
 }

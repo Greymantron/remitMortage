@@ -26,6 +26,14 @@ pub enum MilestoneError {
     InvalidThreshold = 10,
     /// Provided IPFS CID does not match v0 (46-char "Qm…") or v1 (59-char "bafy…") format.
     InvalidCidFormat = 11,
-    /// Reentrant call detected — mutating function already in progress.
-    ReentrancyGuard = 12,
+    /// The minimum timelock between approval and release has not elapsed yet.
+    TimelockNotElapsed = 12,
+    /// Milestone is already disputed and cannot be disputed again.
+    AlreadyDisputed = 13,
+    /// Milestone cannot be disputed in its current status (only Approved/Disbursed).
+    CannotDispute = 14,
+    /// Refund operation failed (cross-contract call to lending pool).
+    RefundFailed = 15,
+    /// Contractor cannot also be the borrower for the same loan.
+    SelfDealingNotAllowed = 16,
 }

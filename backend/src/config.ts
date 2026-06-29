@@ -1,9 +1,20 @@
 /** Environment configuration with validation. */
 
+export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "standalone";
+
+const NETWORK_PASSPHRASE_DEFAULTS: Record<StellarNetwork, string> = {
+  testnet: "Test SDF Network ; September 2015",
+  mainnet: "Public Global Stellar Network ; September 2015",
+  futurenet: "Test SDF Future Network ; October 2022",
+  standalone: "Standalone Network ; February 2017",
+};
+
 export interface Config {
   port: number;
-  stellarNetwork: "testnet" | "mainnet";
+  stellarNetwork: StellarNetwork;
+  networkPassphrase: string;
   horizonUrl: string;
+  sorobanRpcUrl: string;
   escrowContractId: string;
   lendingPoolContractId: string;
   usdcTokenId: string;
@@ -16,14 +27,24 @@ export interface Config {
   smtpFrom: string;
   webhookSecret: string;
   allowedOrigins: string[];
+  adminApiKey: string;
+  redisUrl: string | null;
+  remittanceCacheTtl: number;
 }
 
 export function loadConfig(): Config {
   return {
     port: parseInt(process.env.PORT || "4000", 10),
-    stellarNetwork: (process.env.STELLAR_NETWORK as "testnet" | "mainnet") || "testnet",
+    stellarNetwork: (process.env.STELLAR_NETWORK as StellarNetwork) || "testnet",
+    networkPassphrase:
+      process.env.STELLAR_NETWORK_PASSPHRASE ||
+      NETWORK_PASSPHRASE_DEFAULTS[
+        (process.env.STELLAR_NETWORK as StellarNetwork) || "testnet"
+      ],
     horizonUrl:
       process.env.HORIZON_URL || "https://horizon-testnet.stellar.org",
+    sorobanRpcUrl:
+      process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org",
     escrowContractId: process.env.ESCROW_CONTRACT_ID || "",
     lendingPoolContractId: process.env.LENDING_POOL_CONTRACT_ID || "",
     usdcTokenId: process.env.USDC_TOKEN_ID || "",
@@ -38,5 +59,8 @@ export function loadConfig(): Config {
     allowedOrigins: process.env.ALLOWED_ORIGINS
       ? process.env.ALLOWED_ORIGINS.split(",").map((origin) => origin.trim())
       : ["http://localhost:3000", "http://localhost:4000"],
+    adminApiKey: process.env.ADMIN_API_KEY || "default_admin_api_key",
+    redisUrl: process.env.REDIS_URL || null,
+    remittanceCacheTtl: parseInt(process.env.REMITTANCE_CACHE_TTL || "300", 10),
   };
 }
