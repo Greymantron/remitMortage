@@ -93,12 +93,17 @@ impl VerificationRegistryContract {
         borrower: Address,
         report_hash: BytesN<32>,
         duration_ledgers: u32,
+        score: u32,
     ) -> Result<(), RegistryError> {
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
         if duration_ledgers == 0 {
             return Err(RegistryError::InvalidDuration);
+        }
+
+        if score > 100 {
+            return Err(RegistryError::InvalidScore);
         }
 
         let zero: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
@@ -112,6 +117,7 @@ impl VerificationRegistryContract {
             report_hash,
             verified_ledger,
             expiration_ledger: verified_ledger.saturating_add(duration_ledgers),
+            score,
         };
 
         Self::set_record(&env, &borrower, &record);
@@ -135,6 +141,16 @@ impl VerificationRegistryContract {
         borrower: Address,
     ) -> Result<VerificationRecord, RegistryError> {
         Self::read_record(&env, &borrower).ok_or(RegistryError::VerificationNotFound)
+    }
+
+    /// Returns the anchored credit score for a borrower with a valid,
+    /// non-expired verification record.
+    pub fn get_score(env: Env, borrower: Address) -> Result<u32, RegistryError> {
+        let record = Self::read_record(&env, &borrower).ok_or(RegistryError::VerificationNotFound)?;
+        if env.ledger().sequence() > record.expiration_ledger {
+            return Err(RegistryError::VerificationNotFound);
+        }
+        Ok(record.score)
     }
 
     /// Propose a new admin to take over the contract.
@@ -223,7 +239,7 @@ mod test {
         let borrower = Address::generate(&env);
         let report_hash = BytesN::from_array(&env, &[7u8; 32]);
 
-        client.register_verification(&borrower, &report_hash, &1_000u32);
+        client.register_verification(&borrower, &report_hash, &1_000u32, &80u32);
 
         assert!(client.is_verified(&borrower));
 
@@ -231,6 +247,50 @@ mod test {
         assert_eq!(record.borrower, borrower);
         assert_eq!(record.report_hash, report_hash);
         assert_eq!(record.expiration_ledger, record.verified_ledger + 1_000);
+        assert_eq!(record.score, 80u32);
+    }
+
+    #[test]
+    fn test_get_score_returns_anchored_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup(&env);
+
+        let borrower = Address::generate(&env);
+        let report_hash = BytesN::from_array(&env, &[8u8; 32]);
+
+        client.register_verification(&borrower, &report_hash, &500u32, &72u32);
+        assert_eq!(client.get_score(&borrower), 72u32);
+    }
+
+    #[test]
+    fn test_get_score_fails_for_expired_verification() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup(&env);
+
+        let borrower = Address::generate(&env);
+        let report_hash = BytesN::from_array(&env, &[8u8; 32]);
+
+        let start = env.ledger().sequence();
+        client.register_verification(&borrower, &report_hash, &100u32, &72u32);
+        env.ledger().set_sequence_number(start + 101);
+
+        let result = client.try_get_score(&borrower);
+        assert_eq!(result, Err(Ok(RegistryError::VerificationNotFound)));
+    }
+
+    #[test]
+    fn test_register_invalid_score_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup(&env);
+
+        let borrower = Address::generate(&env);
+        let report_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        let result = client.try_register_verification(&borrower, &report_hash, &100u32, &101u32);
+        assert_eq!(result, Err(Ok(RegistryError::InvalidScore)));
     }
 
     #[test]
@@ -253,7 +313,7 @@ mod test {
         let report_hash = BytesN::from_array(&env, &[9u8; 32]);
 
         let start = env.ledger().sequence();
-        client.register_verification(&borrower, &report_hash, &100u32);
+        client.register_verification(&borrower, &report_hash, &100u32, &80u32);
         assert!(client.is_verified(&borrower));
 
         // Advance the ledger right up to the expiration boundary: still valid.
@@ -274,7 +334,7 @@ mod test {
         let borrower = Address::generate(&env);
         let report_hash = BytesN::from_array(&env, &[1u8; 32]);
 
-        let result = client.try_register_verification(&borrower, &report_hash, &0u32);
+        let result = client.try_register_verification(&borrower, &report_hash, &0u32, &80u32);
         assert_eq!(result, Err(Ok(RegistryError::InvalidDuration)));
     }
 
@@ -287,7 +347,7 @@ mod test {
         let borrower = Address::generate(&env);
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
 
-        let result = client.try_register_verification(&borrower, &zero_hash, &100u32);
+        let result = client.try_register_verification(&borrower, &zero_hash, &100u32, &80u32);
         assert_eq!(result, Err(Ok(RegistryError::InvalidHash)));
     }
 
@@ -302,7 +362,7 @@ mod test {
         let borrower = Address::generate(&env);
         let report_hash = BytesN::from_array(&env, &[1u8; 32]);
 
-        let result = client.try_register_verification(&borrower, &report_hash, &100u32);
+        let result = client.try_register_verification(&borrower, &report_hash, &100u32, &80u32);
         assert_eq!(result, Err(Ok(RegistryError::NotInitialized)));
     }
 
@@ -324,7 +384,7 @@ mod test {
         let report_hash = BytesN::from_array(&env, &[1u8; 32]);
 
         // The admin never signed this call, so `require_auth` panics.
-        client.register_verification(&borrower, &report_hash, &100u32);
+        client.register_verification(&borrower, &report_hash, &100u32, &80u32);
     }
 
     #[test]
@@ -353,11 +413,11 @@ mod test {
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
                 fn_name: "register_verification",
-                args: (borrower.clone(), report_hash.clone(), 100u32).into_val(&env),
+                args: (borrower.clone(), report_hash.clone(), 100u32, 80u32).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
-        client.register_verification(&borrower, &report_hash, &100u32);
+        client.register_verification(&borrower, &report_hash, &100u32, &80u32);
     }
 
     #[test]
@@ -377,7 +437,7 @@ mod test {
         // The new admin can now perform admin-only actions.
         let borrower = Address::generate(&env);
         let report_hash = BytesN::from_array(&env, &[3u8; 32]);
-        client.register_verification(&borrower, &report_hash, &100u32);
+        client.register_verification(&borrower, &report_hash, &100u32, &80u32);
         assert!(client.is_verified(&borrower));
     }
 
@@ -498,11 +558,11 @@ mod test {
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
                 fn_name: "register_verification",
-                args: (borrower.clone(), report_hash.clone(), 100u32).into_val(&env),
+                args: (borrower.clone(), report_hash.clone(), 100u32, 80u32).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
-        client.register_verification(&borrower, &report_hash, &100u32);
+        client.register_verification(&borrower, &report_hash, &100u32, &80u32);
     }
 
     #[test]
@@ -523,7 +583,7 @@ mod test {
 
         let borrower = Address::generate(&env);
         let report_hash = BytesN::from_array(&env, &[6u8; 32]);
-        client.register_verification(&borrower, &report_hash, &100u32);
+        client.register_verification(&borrower, &report_hash, &100u32, &80u32);
         assert!(client.is_verified(&borrower));
     }
 }
