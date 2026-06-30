@@ -15,6 +15,8 @@ pub struct VerificationRecord {
     pub verified_ledger: u32,
     /// Ledger sequence after which the verification is considered expired.
     pub expiration_ledger: u32,
+    /// Anchored credit score (0–100) from the off-chain verification report.
+    pub score: u32,
 }
 
 /// Storage keys for the verification registry contract.

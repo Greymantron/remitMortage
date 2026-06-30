@@ -40,6 +40,16 @@ const FEE_MEDIUM_BPS: u32 = 50;
 /// Withdrawal fee at high utilization (> 80%): 2% = 200 bps.
 const FEE_HIGH_BPS: u32 = 200;
 
+// ── Dynamic Interest Rate Constants ────────────────────────────────────
+/// Excellent tier (score 80–100): 4% APR.
+const INTEREST_RATE_EXCELLENT_BPS: u32 = 400;
+/// Good tier (score 60–79): 6% APR.
+const INTEREST_RATE_GOOD_BPS: u32 = 600;
+/// Fair tier (score 40–59): 8% APR.
+const INTEREST_RATE_FAIR_BPS: u32 = 800;
+/// Fallback rate when verification is missing or expired: 12% APR.
+const INTEREST_RATE_FALLBACK_BPS: u32 = 1200;
+
 /// Lending Pool Contract
 ///
 /// Holds capital from investors/depositors and provides the 70% loan
@@ -178,8 +188,8 @@ impl LendingPoolContract {
 
     /// Returns the configured VerificationRegistry address, if one has been set.
     ///
-    /// `None` means no registry has been configured yet, in which case the
-    /// verification gate in `do_request_loan` is skipped (opt-in gating).
+    /// `None` means no registry has been configured yet, in which case
+    /// `do_request_loan` uses the pool's default interest rate.
     fn read_verification_registry(env: &Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::VerificationRegistry)
     }
@@ -301,6 +311,33 @@ impl LendingPoolContract {
     /// Calculate the fee amount for a given withdrawal amount and fee rate.
     fn calculate_fee_amount(amount: i128, fee_bps: u32) -> i128 {
         (amount * fee_bps as i128) / BPS_SCALE as i128
+    }
+
+    /// Map an anchored verification score to the corresponding interest rate tier.
+    fn interest_rate_from_score(score: u32) -> u32 {
+        if score >= 80 {
+            INTEREST_RATE_EXCELLENT_BPS
+        } else if score >= 60 {
+            INTEREST_RATE_GOOD_BPS
+        } else if score >= 40 {
+            INTEREST_RATE_FAIR_BPS
+        } else {
+            INTEREST_RATE_FALLBACK_BPS
+        }
+    }
+
+    /// Resolve the borrower's loan interest rate from the configured verification
+    /// registry, or fall back to the pool default when no registry is set.
+    fn resolve_borrower_interest_rate(env: &Env, borrower: &Address) -> Result<u32, PoolError> {
+        if let Some(registry) = Self::read_verification_registry(env) {
+            let registry_client = VerificationRegistryContractClient::new(env, &registry);
+            match registry_client.try_get_score(borrower) {
+                Ok(Ok(score)) => Ok(Self::interest_rate_from_score(score)),
+                _ => Ok(INTEREST_RATE_FALLBACK_BPS),
+            }
+        } else {
+            Ok(Self::read_config(env)?.interest_rate_bps)
+        }
     }
 }
 
@@ -518,16 +555,6 @@ impl LendingPoolContract {
             return Err(PoolError::InvalidAmount);
         }
 
-        // Verification gate: if a VerificationRegistry has been configured,
-        // the borrower must have a valid, non-expired verification record
-        // before they can request a loan against pool liquidity.
-        if let Some(registry) = Self::read_verification_registry(env) {
-            let registry_client = VerificationRegistryContractClient::new(env, &registry);
-            if !registry_client.is_verified(&borrower) {
-                return Err(PoolError::ApplicantNotVerified);
-            }
-        }
-
         // Ensure loan ID doesn't already exist.
         if env
             .storage()
@@ -537,14 +564,14 @@ impl LendingPoolContract {
             return Err(PoolError::LoanAlreadyExists);
         }
 
-        let config = Self::read_config(env)?;
+        let interest_rate_bps = Self::resolve_borrower_interest_rate(env, &borrower)?;
 
         let loan = LoanRecord {
             borrower: borrower.clone(),
             principal,
             disbursed: 0,
             repaid: 0,
-            interest_rate_bps: config.interest_rate_bps,
+            interest_rate_bps,
             status: LoanStatus::Requested,
             created_ledger: env.ledger().sequence(),
             last_interest_ledger: env.ledger().sequence(),
@@ -1643,11 +1670,11 @@ impl LendingPoolContract {
     // ── Verification Registry ────────────────────────────────────────────
 
     /// Set (or update) the VerificationRegistry contract address used to
-    /// gate `request_loan`. Admin-only.
+    /// resolve borrower interest rates during `request_loan`. Admin-only.
     ///
-    /// Once set, `request_loan` and `request_loan_with_origin` will reject
-    /// borrowers who do not have a valid, non-expired verification record
-    /// in the registry with `PoolError::ApplicantNotVerified`.
+    /// Once set, `request_loan` queries the registry for the borrower's
+    /// anchored verification score and assigns a tiered interest rate.
+    /// Missing or expired verifications receive the 12% fallback rate.
     pub fn set_verification_registry(env: Env, registry: Address) -> Result<(), PoolError> {
         let config = Self::read_config(&env)?;
         config.admin.require_auth();
@@ -1668,7 +1695,7 @@ impl LendingPoolContract {
     }
 
     /// Returns the configured VerificationRegistry address, or `None` if
-    /// the verification gate has not been enabled.
+    /// dynamic interest rate resolution from verification scores is disabled.
     pub fn get_verification_registry(env: Env) -> Option<Address> {
         Self::read_verification_registry(&env)
     }
@@ -1900,10 +1927,7 @@ mod test {
     };
 
     /// Helper: deploy test token, mint to investor, initialize pool.
-    fn setup_pool(env: &Env) -> (Address, Address, Address, Address, LendingPoolContractClient<\'_>) {
-    fn setup_pool(env: &Env) -> (Address, Address, Address, Address, LendingPoolContractClient<'_,>) {
-    fn setup_pool(env: &Env) -> (Address, Address, Address, LendingPoolContractClient<'_>) {
-        // 8% pool rate, 4% senior fixed rate
+    fn setup_pool(env: &Env) -> (Address, Address, Address, Address, LendingPoolContractClient<'_>) {
         setup_pool_with_rates(env, 800u32, 400u32)
     }
 
@@ -1914,7 +1938,7 @@ mod test {
         env: &Env,
         interest_rate_bps: u32,
         senior_rate_bps: u32,
-    ) -> (Address, Address, Address, LendingPoolContractClient<'_>) {
+    ) -> (Address, Address, Address, Address, LendingPoolContractClient<'_>) {
         let admin = Address::generate(env);
         let investor = Address::generate(env);
         let treasury = Address::generate(env);
@@ -1931,11 +1955,14 @@ mod test {
 
         let contract_id = env.register(LendingPoolContract, ());
         let client = LendingPoolContractClient::new(env, &contract_id);
-        client.initialize(&admin, &token_address, &escrow, &800u32); // 8% interest
-
-        (admin, investor, token_address, escrow, client)
-        // 8% pool rate, 4% senior fixed rate
-        client.initialize(&admin, &token_address, &800u32, &400u32, &treasury);
+        client.initialize(
+            &admin,
+            &token_address,
+            &escrow,
+            &interest_rate_bps,
+            &senior_rate_bps,
+            &treasury,
+        );
 
         (admin, investor, treasury, token_address, client)
     }
@@ -1964,7 +1991,6 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (admin, _investor, token_address, _escrow, client) = setup_pool(&env);
         let (admin, _investor, treasury, token_address, client) = setup_pool(&env);
 
         let config = client.get_pool_config();
@@ -1986,7 +2012,6 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor, token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let token = token::Client::new(&env, &token_address);
 
@@ -2040,7 +2065,6 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor, _token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
 
         let result = client.try_deposit(&investor, &0i128, &Tranche::Senior);
@@ -2052,12 +2076,17 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (admin, _investor, token_address, _escrow, client) = setup_pool(&env);
-
-        let result = client.try_initialize(&admin, &token_address, &_escrow, &800u32);
         let (admin, _investor, _treasury, token_address, client) = setup_pool(&env);
+        let escrow = Address::generate(&env);
 
-        let result = client.try_initialize(&admin, &token_address, &800u32, &400u32, &Address::generate(&env));
+        let result = client.try_initialize(
+            &admin,
+            &token_address,
+            &escrow,
+            &800u32,
+            &400u32,
+            &Address::generate(&env),
+        );
         assert!(result.is_err());
     }
 
@@ -2070,7 +2099,6 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor, _token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -2099,7 +2127,6 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor, _token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -2117,7 +2144,6 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor, _token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -2146,12 +2172,10 @@ mod test {
     #[test]
     fn test_request_loan_succeeds_without_registry_configured() {
         // Backward-compatible default: if no registry has ever been set,
-        // the gate is skipped entirely and loans behave as before.
+        // loans use the pool's configured default interest rate.
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor, token_address, _escrow, client) = setup_pool(&env);
-        let token = token::Client::new(&env, &token_address);
         let (_admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -2161,6 +2185,9 @@ mod test {
         let result = client.try_request_loan(&borrower, &loan_id, &10_000_0000000i128);
         assert!(result.is_ok());
         assert_eq!(client.get_verification_registry(), None);
+
+        let loan = client.get_loan_info(&loan_id);
+        assert_eq!(loan.interest_rate_bps, 800u32);
     }
 
     #[test]
@@ -2204,11 +2231,10 @@ mod test {
     }
 
     #[test]
-    fn test_request_loan_rejects_unverified_borrower() {
+    fn test_request_loan_assigns_fallback_rate_for_unverified_borrower() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor, _token_address, _escrow, client) = setup_pool(&env);
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let registry = setup_registry(&env, &admin);
         client.set_verification_registry(&registry.address);
@@ -2218,17 +2244,18 @@ mod test {
 
         client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
 
-        // Borrower has no record in the registry at all.
         let result = client.try_request_loan(&borrower, &loan_id, &10_000_0000000i128);
-        assert_eq!(result.unwrap_err(), Ok(PoolError::ApplicantNotVerified));
+        assert!(result.is_ok());
+
+        let loan = client.get_loan_info(&loan_id);
+        assert_eq!(loan.interest_rate_bps, INTEREST_RATE_FALLBACK_BPS);
     }
 
     #[test]
-    fn test_request_loan_succeeds_for_verified_borrower() {
+    fn test_request_loan_assigns_excellent_tier_rate() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor, token_address, _escrow, client) = setup_pool(&env);
         let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
         let registry = setup_registry(&env, &admin);
         client.set_verification_registry(&registry.address);
@@ -2237,19 +2264,61 @@ mod test {
         let loan_id = mock_loan_id(&env);
         let report_hash = BytesN::from_array(&env, &[9u8; 32]);
 
-        registry.register_verification(&borrower, &report_hash, &1_000u32);
+        registry.register_verification(&borrower, &report_hash, &1_000u32, &85u32);
 
         client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
-
-        let result = client.try_request_loan(&borrower, &loan_id, &10_000_0000000i128);
-        assert!(result.is_ok());
+        client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
 
         let loan = client.get_loan_info(&loan_id);
-        assert_eq!(loan.status, LoanStatus::Requested);
+        assert_eq!(loan.interest_rate_bps, INTEREST_RATE_EXCELLENT_BPS);
     }
 
     #[test]
-    fn test_request_loan_rejects_borrower_with_expired_verification() {
+    fn test_request_loan_assigns_good_tier_rate() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
+        let registry = setup_registry(&env, &admin);
+        client.set_verification_registry(&registry.address);
+
+        let borrower = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+        let report_hash = BytesN::from_array(&env, &[10u8; 32]);
+
+        registry.register_verification(&borrower, &report_hash, &1_000u32, &70u32);
+
+        client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
+        client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
+
+        let loan = client.get_loan_info(&loan_id);
+        assert_eq!(loan.interest_rate_bps, INTEREST_RATE_GOOD_BPS);
+    }
+
+    #[test]
+    fn test_request_loan_assigns_fair_tier_rate() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, investor, _treasury, _token_address, client) = setup_pool(&env);
+        let registry = setup_registry(&env, &admin);
+        client.set_verification_registry(&registry.address);
+
+        let borrower = Address::generate(&env);
+        let loan_id = mock_loan_id(&env);
+        let report_hash = BytesN::from_array(&env, &[11u8; 32]);
+
+        registry.register_verification(&borrower, &report_hash, &1_000u32, &50u32);
+
+        client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
+        client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
+
+        let loan = client.get_loan_info(&loan_id);
+        assert_eq!(loan.interest_rate_bps, INTEREST_RATE_FAIR_BPS);
+    }
+
+    #[test]
+    fn test_request_loan_assigns_fallback_rate_for_expired_verification() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -2261,22 +2330,18 @@ mod test {
         let loan_id = mock_loan_id(&env);
         let report_hash = BytesN::from_array(&env, &[4u8; 32]);
 
-        // Verification expires after 50 ledgers.
-        registry.register_verification(&borrower, &report_hash, &50u32);
-
-        // Advance the ledger well past expiration.
+        registry.register_verification(&borrower, &report_hash, &50u32, &90u32);
         env.ledger().with_mut(|li| li.sequence_number += 1_000);
 
         client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
+        client.request_loan(&borrower, &loan_id, &10_000_0000000i128);
 
-        let result = client.try_request_loan(&borrower, &loan_id, &10_000_0000000i128);
-        assert_eq!(result.unwrap_err(), Ok(PoolError::ApplicantNotVerified));
+        let loan = client.get_loan_info(&loan_id);
+        assert_eq!(loan.interest_rate_bps, INTEREST_RATE_FALLBACK_BPS);
     }
 
     #[test]
-    fn test_request_loan_with_origin_also_gated() {
-        // The escrow bridge entry point shares the same gate, so a borrower
-        // cannot bypass verification by routing through the escrow path.
+    fn test_request_loan_with_origin_uses_dynamic_rate() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -2290,13 +2355,17 @@ mod test {
 
         client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
 
-        let result = client.try_request_loan_with_origin(
-            &borrower,
-            &loan_id,
-            &10_000_0000000i128,
-            &escrow_origin,
-        );
-        assert_eq!(result.unwrap_err(), Ok(PoolError::ApplicantNotVerified));
+        client
+            .request_loan_with_origin(
+                &borrower,
+                &loan_id,
+                &10_000_0000000i128,
+                &escrow_origin,
+            )
+            .unwrap();
+
+        let loan = client.get_loan_info(&loan_id);
+        assert_eq!(loan.interest_rate_bps, INTEREST_RATE_FALLBACK_BPS);
     }
 
     #[test]
@@ -2379,9 +2448,8 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor, token_address, _escrow, client) = setup_pool(&env);
-        let token = token::Client::new(&env, &token_address);
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
+        let token = token::Client::new(&env, &token_address);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
 
@@ -2404,7 +2472,6 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor, _token_address, _escrow, client) = setup_pool(&env);
         let (_admin, senior_investor, _treasury, token_address, client) = setup_pool(&env);
         let sac = StellarAssetClient::new(&env, &token_address);
 
@@ -2448,10 +2515,6 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor1, token_address, _escrow, client) = setup_pool(&env);
-        
-        // Setup investor 2
-        let investor2 = Address::generate(&env);
         let (_admin, senior_investor, _treasury, token_address, client) = setup_pool(&env);
         let sac = StellarAssetClient::new(&env, &token_address);
 
@@ -2559,7 +2622,6 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor, token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -2588,7 +2650,6 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (_admin, investor, token_address, _escrow, client) = setup_pool(&env);
         let (_admin, investor, _treasury, token_address, client) = setup_pool(&env);
         let borrower = Address::generate(&env);
         let loan_id = mock_loan_id(&env);
@@ -2657,9 +2718,16 @@ mod test {
 
         let contract_id = env.register(LendingPoolContract, ());
         let client = LendingPoolContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &token_address, &mock_escrow, &800u32);
+        client.initialize(
+            &admin,
+            &token_address,
+            &mock_escrow,
+            &800u32,
+            &400u32,
+            &Address::generate(&env),
+        );
 
-        client.deposit(&investor, &70_000_0000000i128);
+        client.deposit(&investor, &70_000_0000000i128, &Tranche::Senior);
         client.request_loan(&borrower, &loan_id, &70_000_0000000i128);
         client.approve_loan(&loan_id);
 
@@ -2693,7 +2761,6 @@ mod test {
     fn test_unauthorized_withdrawal() {
         let env = Env::default();
 
-        let (_admin, _investor, _token_address, _escrow, client) = setup_pool(&env);
         let (_admin, _investor, _treasury, _token_address, client) = setup_pool(&env);
         let unauthorized = Address::generate(&env);
 

@@ -201,8 +201,9 @@ pub enum DataKey {
     PendingAdmin,
     /// Total withdrawal fees collected and routed to treasury.
     TotalWithdrawalFees,
-    /// Address of the VerificationRegistry contract used to gate loan requests.
-    /// Absent until `set_verification_registry` is called by the admin.
+    /// Address of the VerificationRegistry contract used to resolve borrower
+    /// interest rates during loan requests. Absent until `set_verification_registry`
+    /// is called by the admin.
     VerificationRegistry,
     /// Global daily borrow limit.
     DailyBorrowLimit,
