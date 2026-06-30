@@ -1928,6 +1928,7 @@ mod test {
 
     /// Helper: deploy test token, mint to investor, initialize pool.
     fn setup_pool(env: &Env) -> (Address, Address, Address, Address, LendingPoolContractClient<'_>) {
+        // 8% pool rate, 4% senior fixed rate
         setup_pool_with_rates(env, 800u32, 400u32)
     }
 
@@ -1955,14 +1956,7 @@ mod test {
 
         let contract_id = env.register(LendingPoolContract, ());
         let client = LendingPoolContractClient::new(env, &contract_id);
-        client.initialize(
-            &admin,
-            &token_address,
-            &escrow,
-            &interest_rate_bps,
-            &senior_rate_bps,
-            &treasury,
-        );
+        client.initialize(&admin, &token_address, &escrow, &interest_rate_bps, &senior_rate_bps, &treasury);
 
         (admin, investor, treasury, token_address, client)
     }
@@ -2077,16 +2071,8 @@ mod test {
         env.mock_all_auths();
 
         let (admin, _investor, _treasury, token_address, client) = setup_pool(&env);
-        let escrow = Address::generate(&env);
 
-        let result = client.try_initialize(
-            &admin,
-            &token_address,
-            &escrow,
-            &800u32,
-            &400u32,
-            &Address::generate(&env),
-        );
+        let result = client.try_initialize(&admin, &token_address, &Address::generate(&env), &800u32, &400u32, &Address::generate(&env));
         assert!(result.is_err());
     }
 
