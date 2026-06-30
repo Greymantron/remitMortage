@@ -115,7 +115,7 @@ fn withdraw_at_tier2_transition_block_uses_tier2_rate() {
 fn tier_boundaries_select_the_correct_rate() {
     // One env per boundary so the borrower record is fresh each time.
     let cases: [(u32, u32); 4] = [
-        (0, 500),                    // month 1  -> tier1
+        (0, 500),                     // month 1  -> tier1
         (LEDGERS_PER_MONTH * 2, 300), // month 3  -> tier2 (first ledger of tier2)
         (LEDGERS_PER_MONTH * 4, 150), // month 5  -> tier3
         (LEDGERS_PER_MONTH * 6, 50),  // month 7  -> tier4
