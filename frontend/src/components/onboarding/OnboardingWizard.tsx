@@ -4,15 +4,15 @@ import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { useForm, useWatch, Controller } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { getOnboardingStore, useOnboardingState } from "./useOnboardingState";
+import { getOnboardingStore, useOnboardingState } from "@/hooks/useOnboardingState";
 import {
   onboardingSchema,
   STEP_FIELDS,
   type OnboardingFormValues,
-} from "./onboardingSchema";
+} from "@/lib/onboardingSchema";
 import ProgressStepper from "./ProgressStepper";
 import { toast } from "react-hot-toast";
-import { useWallet } from "../context/WalletContext";
+import { useWallet } from "@/context/WalletContext";
 
 const STEPS = ["Connect Wallet", "Verify History", "Set Goal", "First Deposit"];
 

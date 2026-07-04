@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import dynamic from "next/dynamic";
-import OnboardingWizard from "./OnboardingWizard";
+import OnboardingWizard from "@/components/onboarding/OnboardingWizard";
 import CreditCalculator from "@/components/CreditCalculator";
 
 const Navbar = dynamic(() => import("../components/Navbar"), { ssr: false });

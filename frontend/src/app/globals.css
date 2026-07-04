@@ -250,6 +250,8 @@ body {
 
 .animate-toast-in {
   animation: toast-slide-in 0.3s cubic-bezier(0.21, 1.02, 0.73, 1) both;
+}
+
 .animate-modal-pop {
   animation: modal-pop 0.28s cubic-bezier(0.2, 0.9, 0.25, 1) both;
 }

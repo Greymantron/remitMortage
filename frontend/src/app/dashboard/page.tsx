@@ -5,7 +5,7 @@ export const dynamic = "force-dynamic";
 import React, { useEffect, useState } from "react";
 import loadDynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
-import { WalletProvider, useWallet } from "../../context/WalletContext";
+import { useWallet } from "../../context/WalletContext";
 import SavingsProgressCard from "../../components/SavingsProgressCard";
 import LoanStatusCard from "../../components/LoanStatusCard";
 import DepositModal from "../../components/DepositModal";
@@ -94,7 +94,7 @@ const SAMPLE_MILESTONES: MilestoneNode[] = [
   },
 ];
 
-function DashboardInner() {
+export default function DashboardPage() {
   const router = useRouter();
   const { publicKey, isConnected } = useWallet();
   const [status, setStatus] = useState<BorrowerStatus | null>(null);
@@ -233,13 +233,5 @@ function DashboardInner() {
         )}
       </main>
     </div>
-  );
-}
-
-export default function DashboardPage() {
-  return (
-    <WalletProvider>
-      <DashboardInner />
-    </WalletProvider>
   );
 }

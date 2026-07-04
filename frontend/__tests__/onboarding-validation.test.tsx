@@ -1,7 +1,7 @@
 import React from "react";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import OnboardingWizard from "../src/app/OnboardingWizard";
-import { getOnboardingStore } from "../src/app/useOnboardingState";
+import OnboardingWizard from "../src/components/onboarding/OnboardingWizard";
+import { getOnboardingStore } from "../src/hooks/useOnboardingState";
 
 // Mock the Next.js router
 jest.mock("next/navigation", () => ({
